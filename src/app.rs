@@ -909,6 +909,9 @@ impl App {
             let action = item.action;
             item.button.connect_clicked(move |_| {
                 if let Some(app) = weak.upgrade() {
+                    if crate::canvas::input_debug_enabled() {
+                        crate::canvas::input_debug_log("[sumi:wheel] item clicked");
+                    }
                     app.run_wheel_action(action);
                     app.wheel.close();
                 }
@@ -927,7 +930,10 @@ impl App {
             let weak = Rc::downgrade(self);
             let position = self.wheel.position.clone();
             let click = gtk::GestureClick::new();
-            click.connect_pressed(move |_, _, x, y| {
+            // Close only on release. Closing on press can cancel the release
+            // that GtkButton needs in order to emit `clicked`, making wheel
+            // items appear unresponsive.
+            click.connect_released(move |_, _, x, y| {
                 let (px, py) = position.get();
                 let inside = x >= px
                     && x <= px + WHEEL_SIZE as f64
@@ -962,10 +968,14 @@ impl App {
         match action {
             WheelAction::Tool(tool) => self.activate_tool(tool),
             WheelAction::Undo => {
-                self.canvas.undo();
+                if !self.canvas.undo() {
+                    self.toast("元に戻す操作はありません");
+                }
             }
             WheelAction::Redo => {
-                self.canvas.redo();
+                if !self.canvas.redo() {
+                    self.toast("やり直す操作はありません");
+                }
             }
         }
         self.canvas.area.grab_focus();
@@ -1097,6 +1107,10 @@ impl App {
                     }
                     if key == gdk::Key::f || key == gdk::Key::F {
                         app.canvas.fit();
+                        return glib::Propagation::Stop;
+                    }
+                    if key == gdk::Key::w || key == gdk::Key::W {
+                        app.open_tool_wheel();
                         return glib::Propagation::Stop;
                     }
                 }
