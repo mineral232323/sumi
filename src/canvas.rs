@@ -1714,27 +1714,9 @@ fn stroke_samples(stroke: &Stroke) -> Vec<(f64, f64, f64)> {
     if points.is_empty() {
         return Vec::new();
     }
-    let base = stroke.width.max(0.4);
-    let mut widths = Vec::with_capacity(points.len());
-    for point in points {
-        let mut w = if stroke.tool == StrokeTool::Highlighter {
-            base
-        } else {
-            base * (0.42 + point.p.clamp(0.05, 1.0))
-        };
-        w = w.max(0.4);
-        widths.push(w);
-    }
-    // Soften pressure changes so the line does not pulse.
-    if widths.len() > 2 {
-        let mut smoothed = widths.clone();
-        for i in 1..widths.len() - 1 {
-            smoothed[i] = (widths[i - 1] + widths[i] * 2.0 + widths[i + 1]) * 0.25;
-        }
-        widths = smoothed;
-    }
+    let width = stroke.width.max(0.4);
     if points.len() == 1 {
-        return vec![(points[0].x, points[0].y, widths[0])];
+        return vec![(points[0].x, points[0].y, width)];
     }
 
     let mut out = Vec::new();
@@ -1752,33 +1734,11 @@ fn stroke_samples(stroke: &Stroke) -> Vec<(f64, f64, f64)> {
             let t = step as f64 / steps as f64;
             let x = catmull(p0.x, p1.x, p2.x, p3.x, t);
             let y = catmull(p0.y, p1.y, p2.y, p3.y, t);
-            let w = widths[i] + (widths[i + 1] - widths[i]) * t;
-            out.push((x, y, w));
+            out.push((x, y, width));
         }
     }
     let last = points[n - 1];
-    out.push((last.x, last.y, widths[n - 1]));
-
-    if stroke.tool == StrokeTool::Pen {
-        let mut cumulative = Vec::with_capacity(out.len());
-        let mut total = 0.0;
-        for i in 0..out.len() {
-            if i > 0 {
-                total += ((out[i].0 - out[i - 1].0).powi(2)
-                    + (out[i].1 - out[i - 1].1).powi(2))
-                .sqrt();
-            }
-            cumulative.push(total);
-        }
-        let taper = 8.0_f64.min(total * 0.25);
-        if taper > 0.5 {
-            for i in 0..out.len() {
-                let d = cumulative[i].min(total - cumulative[i]);
-                let factor = (d / taper).clamp(0.38, 1.0);
-                out[i].2 *= factor;
-            }
-        }
-    }
+    out.push((last.x, last.y, width));
     out
 }
 
