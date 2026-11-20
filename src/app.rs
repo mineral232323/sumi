@@ -39,6 +39,7 @@ struct Toolbar {
     pen: gtk::ToggleButton,
     highlighter: gtk::ToggleButton,
     eraser: gtk::ToggleButton,
+    select: gtk::ToggleButton,
     hand: gtk::ToggleButton,
     palette: gtk::Box,
     pen_palette: gtk::Box,
@@ -54,6 +55,7 @@ impl Toolbar {
             Tool::Pen => &self.pen,
             Tool::Highlighter => &self.highlighter,
             Tool::Eraser => &self.eraser,
+            Tool::Select => &self.select,
             Tool::Hand => &self.hand,
         }
     }
@@ -110,8 +112,21 @@ impl ToolWheel {
                 "マーカー",
                 WheelAction::Tool(Tool::Highlighter),
             ),
-            ("sumi-eraser-symbolic", "消しゴム", WheelAction::Tool(Tool::Eraser)),
-            ("sumi-hand-symbolic", "手のひら", WheelAction::Tool(Tool::Hand)),
+            (
+                "sumi-eraser-symbolic",
+                "消しゴム",
+                WheelAction::Tool(Tool::Eraser),
+            ),
+            (
+                "sumi-hand-symbolic",
+                "手のひら",
+                WheelAction::Tool(Tool::Hand),
+            ),
+            (
+                "sumi-select-symbolic",
+                "選択",
+                WheelAction::Tool(Tool::Select),
+            ),
             ("edit-undo-symbolic", "元に戻す", WheelAction::Undo),
             ("edit-redo-symbolic", "やり直す", WheelAction::Redo),
         ];
@@ -477,15 +492,18 @@ fn build_toolbar() -> Toolbar {
     let pen = tool_button("sumi-pen-symbolic", "ペン (1)");
     let highlighter = tool_button("sumi-highlighter-symbolic", "マーカー (2)");
     let eraser = tool_button("sumi-eraser-symbolic", "消しゴム (3)");
+    let select = tool_button("sumi-select-symbolic", "選択 (5)");
     let hand = tool_button("sumi-hand-symbolic", "移動 (4)");
     highlighter.set_group(Some(&pen));
     eraser.set_group(Some(&pen));
+    select.set_group(Some(&pen));
     hand.set_group(Some(&pen));
     pen.set_active(true);
 
     root.append(&pen);
     root.append(&highlighter);
     root.append(&eraser);
+    root.append(&select);
     root.append(&hand);
     root.append(&separator());
 
@@ -528,6 +546,7 @@ fn build_toolbar() -> Toolbar {
         pen,
         highlighter,
         eraser,
+        select,
         hand,
         palette,
         pen_palette,
@@ -561,9 +580,7 @@ fn make_swatch(id: &str, color: &str) -> gtk::Button {
     button.add_css_class(&class);
     if let Some(display) = gdk::Display::default() {
         let provider = gtk::CssProvider::new();
-        provider.load_from_data(&format!(
-            "button.{class} {{ background-color: {color}; }}"
-        ));
+        provider.load_from_data(&format!("button.{class} {{ background-color: {color}; }}"));
         gtk::style_context_add_provider_for_display(
             &display,
             &provider,
@@ -664,6 +681,7 @@ impl App {
             (Tool::Pen, self.toolbar.pen.clone()),
             (Tool::Highlighter, self.toolbar.highlighter.clone()),
             (Tool::Eraser, self.toolbar.eraser.clone()),
+            (Tool::Select, self.toolbar.select.clone()),
             (Tool::Hand, self.toolbar.hand.clone()),
         ] {
             let weak = Rc::downgrade(self);
@@ -703,14 +721,14 @@ impl App {
                             Tool::Pen => st.pen_size = value,
                             Tool::Highlighter => st.highlighter_size = value,
                             Tool::Eraser => st.eraser_size = value,
-                            Tool::Hand => {}
+                            Tool::Select | Tool::Hand => {}
                         }
                     }
                     match tool {
                         Tool::Pen => app.canvas.set_pen_size(value),
                         Tool::Highlighter => app.canvas.set_highlighter_size(value),
                         Tool::Eraser => app.canvas.set_eraser_size(value),
-                        Tool::Hand => {}
+                        Tool::Select | Tool::Hand => {}
                     }
                     app.toolbar.size_value.set_text(&format!("{value:.1}"));
                 }
@@ -775,7 +793,10 @@ impl App {
         }
         {
             let weak = Rc::downgrade(self);
-            self.zoom_pill.first_child().and_then(|w| w.next_sibling()).map(|_| ());
+            self.zoom_pill
+                .first_child()
+                .and_then(|w| w.next_sibling())
+                .map(|_| ());
             // The three zoom buttons are wired by walking the pill's children.
             let mut child = self.zoom_pill.first_child();
             let mut index = 0;
@@ -835,12 +856,7 @@ impl App {
                 if index < 0 {
                     return;
                 }
-                let id = app
-                    .state
-                    .borrow()
-                    .displayed
-                    .get(index as usize)
-                    .cloned();
+                let id = app.state.borrow().displayed.get(index as usize).cloned();
                 if let Some(id) = id {
                     if app.state.borrow().active_id.as_deref() == Some(id.as_str()) {
                         return;
@@ -1016,8 +1032,11 @@ impl App {
                     app.canvas.stylus_key_down(key.into_glib());
                     return glib::Propagation::Stop;
                 }
-                if key == gdk::Key::Escape && app.wheel.is_open() {
-                    app.wheel.close();
+                if key == gdk::Key::Escape {
+                    if app.wheel.is_open() {
+                        app.wheel.close();
+                    }
+                    app.canvas.clear_selection();
                     app.canvas.area.grab_focus();
                     return glib::Propagation::Stop;
                 }
@@ -1061,6 +1080,36 @@ impl App {
                     app.canvas.set_space_down(true);
                     return glib::Propagation::Stop;
                 }
+                if ctrl && (key == gdk::Key::c || key == gdk::Key::C) {
+                    app.canvas.copy_selection();
+                    return glib::Propagation::Stop;
+                }
+                if ctrl && (key == gdk::Key::x || key == gdk::Key::X) {
+                    app.canvas.cut_selection();
+                    app.canvas.area.grab_focus();
+                    return glib::Propagation::Stop;
+                }
+                if ctrl && (key == gdk::Key::v || key == gdk::Key::V) {
+                    if app.state.borrow().active_tool != Tool::Select {
+                        app.activate_tool(Tool::Select);
+                    }
+                    app.canvas.paste_clipboard();
+                    app.canvas.area.grab_focus();
+                    return glib::Propagation::Stop;
+                }
+                if ctrl && (key == gdk::Key::a || key == gdk::Key::A) {
+                    if app.state.borrow().active_tool == Tool::Select {
+                        app.canvas.select_all();
+                        app.canvas.area.grab_focus();
+                        return glib::Propagation::Stop;
+                    }
+                }
+                if key == gdk::Key::Delete || key == gdk::Key::BackSpace {
+                    if app.canvas.delete_selection() {
+                        app.canvas.area.grab_focus();
+                        return glib::Propagation::Stop;
+                    }
+                }
                 if ctrl && (key == gdk::Key::z || key == gdk::Key::Z) {
                     if shift {
                         app.canvas.redo();
@@ -1099,6 +1148,7 @@ impl App {
                         gdk::Key::_2 => Some(Tool::Highlighter),
                         gdk::Key::_3 => Some(Tool::Eraser),
                         gdk::Key::_4 => Some(Tool::Hand),
+                        gdk::Key::_5 => Some(Tool::Select),
                         _ => None,
                     };
                     if let Some(tool) = tool {
@@ -1163,9 +1213,7 @@ impl App {
                     crate::canvas::log_input_event(event);
                 }
                 let kind = event.event_type();
-                if kind != gdk::EventType::ButtonPress
-                    && kind != gdk::EventType::ButtonRelease
-                {
+                if kind != gdk::EventType::ButtonPress && kind != gdk::EventType::ButtonRelease {
                     return glib::Propagation::Proceed;
                 }
                 let Some(app) = weak.upgrade() else {
@@ -1206,7 +1254,11 @@ impl App {
         body.set_width_request(218);
 
         for (kind, title, subtitle) in [
-            (NoteKind::Infinite, "無限キャンバス", "ページのない自由なノート"),
+            (
+                NoteKind::Infinite,
+                "無限キャンバス",
+                "ページのない自由なノート",
+            ),
             (NoteKind::Paged, "ページノート", "A4ページを重ねるノート"),
             (NoteKind::Pdf, "PDFを読み込む", "PDFに手書きして注釈"),
         ] {
@@ -1584,7 +1636,8 @@ impl App {
     }
 
     fn update_view(&self, info: ViewInfo) {
-        self.zoom_label.set_label(&format!("{:.0}%", info.zoom * 100.0));
+        self.zoom_label
+            .set_label(&format!("{:.0}%", info.zoom * 100.0));
         let has_note = info.kind.is_some();
         self.toolbar.root.set_visible(has_note);
         self.zoom_pill.set_visible(has_note);
@@ -1671,8 +1724,8 @@ impl App {
                 st.pen_color = color.to_string();
             }
         }
-        let applies = (highlighter && active == Tool::Highlighter)
-            || (!highlighter && active == Tool::Pen);
+        let applies =
+            (highlighter && active == Tool::Highlighter) || (!highlighter && active == Tool::Pen);
         if applies {
             self.canvas.set_color(color);
         }
@@ -1697,14 +1750,15 @@ impl App {
         self.toolbar
             .highlight_palette
             .set_visible(tool == Tool::Highlighter);
-        self.toolbar.size.set_visible(tool != Tool::Hand);
-        self.toolbar.size_value.set_visible(tool != Tool::Hand);
+        let show_size = matches!(tool, Tool::Pen | Tool::Highlighter | Tool::Eraser);
+        self.toolbar.size.set_visible(show_size);
+        self.toolbar.size_value.set_visible(show_size);
 
         let (lower, upper, value) = match tool {
             Tool::Pen => (0.8, 14.0, pen_size),
             Tool::Highlighter => (8.0, 44.0, highlighter_size),
             Tool::Eraser => (8.0, 60.0, eraser_size),
-            Tool::Hand => (0.8, 14.0, pen_size),
+            Tool::Select | Tool::Hand => (0.8, 14.0, pen_size),
         };
         {
             let mut st = self.state.borrow_mut();
@@ -1737,7 +1791,9 @@ impl App {
     }
 
     fn rename_current(self: &Rc<Self>) {
-        let Some(note) = self.canvas.note() else { return };
+        let Some(note) = self.canvas.note() else {
+            return;
+        };
         let dialog = adw::AlertDialog::new(Some("名前を変更"), None);
         let entry = gtk::Entry::new();
         entry.set_text(&note.title);
@@ -1780,7 +1836,9 @@ impl App {
     }
 
     fn delete_current(self: &Rc<Self>) {
-        let Some(note) = self.canvas.note() else { return };
+        let Some(note) = self.canvas.note() else {
+            return;
+        };
         let dialog = adw::AlertDialog::new(
             Some("ノートを削除しますか？"),
             Some("この操作は取り消せません。"),

@@ -17,6 +17,10 @@ const ACTIONS: &[(&str, &str)] = &[
         include_str!("../assets/icons/actions/sumi-eraser-symbolic.svg"),
     ),
     (
+        "sumi-select-symbolic.svg",
+        include_str!("../assets/icons/actions/sumi-select-symbolic.svg"),
+    ),
+    (
         "sumi-hand-symbolic.svg",
         include_str!("../assets/icons/actions/sumi-hand-symbolic.svg"),
     ),

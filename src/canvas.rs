@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::f64::consts::{PI, TAU};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,9 +54,7 @@ pub(crate) fn log_input_event(event: &gdk::Event) {
     let source = device.as_ref().map(|d| d.source());
     let name = device.as_ref().map(|d| d.name().to_string());
     let tool = event.device_tool();
-    let button = event
-        .downcast_ref::<gdk::ButtonEvent>()
-        .map(|e| e.button());
+    let button = event.downcast_ref::<gdk::ButtonEvent>().map(|e| e.button());
     input_debug_log(&format!(
         "[sumi:input] type={:?} source={:?} device={:?} tool={:?} button={:?} mods={:?} pos={:?} pressure={:?} tilt={:?}",
         event.event_type(),
@@ -86,6 +84,7 @@ pub enum Tool {
     Pen,
     Highlighter,
     Eraser,
+    Select,
     Hand,
 }
 
@@ -135,6 +134,20 @@ enum Interaction {
         start_zoom: f64,
         start_camera: Camera,
     },
+    Select {
+        page: usize,
+        start: (f64, f64),
+        current: (f64, f64),
+        additive: bool,
+    },
+    MoveSelection {
+        page: usize,
+        start: (f64, f64),
+        delta: (f64, f64),
+        moved: bool,
+        ids: Vec<u64>,
+        originals: Vec<(usize, Stroke)>,
+    },
 }
 
 enum LiveItem {
@@ -154,6 +167,16 @@ enum Action {
     },
     AddPage {
         index: usize,
+    },
+    AddStrokes {
+        page: usize,
+        items: Vec<(usize, Stroke)>,
+    },
+    MoveStrokes {
+        page: usize,
+        ids: Vec<u64>,
+        dx: f64,
+        dy: f64,
     },
 }
 
@@ -190,6 +213,10 @@ struct State {
     undo: Vec<Action>,
     redo: Vec<Action>,
 
+    selection: Vec<u64>,
+    selection_page: Option<usize>,
+    clipboard: Vec<Stroke>,
+
     cache: Option<ImageSurface>,
     cache_dirty: bool,
     path_cache: HashMap<(usize, usize), Path>,
@@ -205,8 +232,7 @@ struct State {
 
 impl State {
     fn new() -> Self {
-        let scratch_surface =
-            ImageSurface::create(Format::ARgb32, 4, 4).expect("scratch surface");
+        let scratch_surface = ImageSurface::create(Format::ARgb32, 4, 4).expect("scratch surface");
         let scratch_ctx = Context::new(&scratch_surface).expect("scratch context");
         Self {
             note: None,
@@ -230,6 +256,9 @@ impl State {
             stylus_buttons: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
+            selection: Vec::new(),
+            selection_page: None,
+            clipboard: Vec::new(),
             cache: None,
             cache_dirty: true,
             path_cache: HashMap::new(),
@@ -252,7 +281,7 @@ impl State {
             Tool::Pen => self.pen_size,
             Tool::Highlighter => self.highlighter_size,
             Tool::Eraser => self.eraser_size,
-            Tool::Hand => self.pen_size,
+            Tool::Select | Tool::Hand => self.pen_size,
         }
     }
 
@@ -362,6 +391,54 @@ impl State {
         self.path_cache.clear();
         self.cache_dirty = true;
     }
+
+    fn clear_selection(&mut self) {
+        self.selection.clear();
+        self.selection_page = None;
+    }
+
+    fn prune_selection(&mut self) {
+        let Some(page) = self.selection_page else {
+            self.selection.clear();
+            return;
+        };
+        let Some(note) = &self.note else {
+            self.clear_selection();
+            return;
+        };
+        let Some(page_data) = note.pages.get(page) else {
+            self.clear_selection();
+            return;
+        };
+        self.selection
+            .retain(|id| page_data.strokes.iter().any(|stroke| stroke.id == *id));
+        if self.selection.is_empty() {
+            self.selection_page = None;
+        }
+    }
+
+    fn selection_indices(&self, page: usize) -> Vec<usize> {
+        let Some(note) = &self.note else {
+            return Vec::new();
+        };
+        let Some(page_data) = note.pages.get(page) else {
+            return Vec::new();
+        };
+        page_data
+            .strokes
+            .iter()
+            .enumerate()
+            .filter(|(_, stroke)| self.selection.contains(&stroke.id))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn selection_origin(&self, page: usize) -> (f64, f64) {
+        self.layout
+            .get(page)
+            .map(|rect| (rect.x, rect.y))
+            .unwrap_or((0.0, 0.0))
+    }
 }
 
 pub struct Canvas {
@@ -378,13 +455,8 @@ impl Canvas {
         area.add_css_class("sumi-canvas");
         // Invisible cursor: the canvas draws its own tool ring.
         let blank = glib::Bytes::from_static(&[0, 0, 0, 0]);
-        let texture = gdk::MemoryTexture::new(
-            1,
-            1,
-            gdk::MemoryFormat::R8g8b8a8Premultiplied,
-            &blank,
-            4,
-        );
+        let texture =
+            gdk::MemoryTexture::new(1, 1, gdk::MemoryFormat::R8g8b8a8Premultiplied, &blank, 4);
         let cursor = gdk::Cursor::from_texture(&texture, 0, 0, None);
         area.set_cursor(Some(&cursor));
         let state = Rc::new(RefCell::new(State::new()));
@@ -455,7 +527,10 @@ impl Canvas {
                         s.stylus_tool = stylus_tool_for_event_state(g.current_event_state());
                     }
                     s.cursor = Some((x, y));
-                    pointer_down(&mut s, x, y, pressure);
+                    let additive = g
+                        .current_event_state()
+                        .contains(gdk::ModifierType::SHIFT_MASK);
+                    pointer_down(&mut s, x, y, pressure, additive);
                     drop(s);
                     area.queue_draw();
                 }
@@ -555,8 +630,7 @@ impl Canvas {
                                     s.stylus_buttons.push(button);
                                 }
                                 let was_eraser = s.stylus_tool == Some(Tool::Eraser);
-                                s.stylus_tool =
-                                    stylus_tool_for_buttons(&s.stylus_buttons);
+                                s.stylus_tool = stylus_tool_for_buttons(&s.stylus_buttons);
                                 s.cursor = Some((x, y));
                                 // Pressing the eraser button in the middle of a
                                 // stroke switches straight to erasing.
@@ -565,7 +639,10 @@ impl Canvas {
                                     && matches!(&s.interaction, Interaction::Stroke { .. })
                                 {
                                     committed = pointer_up(&mut s, x, y, pressure);
-                                    pointer_down(&mut s, x, y, pressure);
+                                    let additive = event
+                                        .modifier_state()
+                                        .contains(gdk::ModifierType::SHIFT_MASK);
+                                    pointer_down(&mut s, x, y, pressure, additive);
                                 }
                             }
                             area.queue_draw();
@@ -590,8 +667,7 @@ impl Canvas {
                             // Keep the current tool while a stroke is still in
                             // progress; the stylus-up handler clears it.
                             if matches!(&s.interaction, Interaction::None) {
-                                s.stylus_tool =
-                                    stylus_tool_for_buttons(&s.stylus_buttons);
+                                s.stylus_tool = stylus_tool_for_buttons(&s.stylus_buttons);
                             }
                             drop(s);
                             area.queue_draw();
@@ -637,7 +713,10 @@ impl Canvas {
                         }
                         _ => {
                             s.cursor = Some((x, y));
-                            pointer_down(&mut s, x, y, 0.5);
+                            let additive = g
+                                .current_event_state()
+                                .contains(gdk::ModifierType::SHIFT_MASK);
+                            pointer_down(&mut s, x, y, 0.5, additive);
                         }
                     }
                     drop(s);
@@ -695,6 +774,37 @@ impl Canvas {
             }
         });
         area.add_controller(drag);
+
+        // Mouse clicks select without starting a drag. Pen and touch are
+        // handled by the stylus/zoom gestures above.
+        let click = gtk::GestureClick::new();
+        click.set_button(1);
+        click.connect_pressed({
+            let state = state.clone();
+            let area_w = area.downgrade();
+            move |g, _n, x, y| {
+                let source = g.current_event_device().map(|d| d.source());
+                if source != Some(gdk::InputSource::Mouse) {
+                    return;
+                }
+                let additive = g
+                    .current_event_state()
+                    .contains(gdk::ModifierType::SHIFT_MASK);
+                {
+                    let mut s = state.borrow_mut();
+                    if s.active_tool() != Tool::Select
+                        || !matches!(s.interaction, Interaction::None)
+                    {
+                        return;
+                    }
+                    select_click(&mut s, x, y, additive);
+                }
+                if let Some(area) = area_w.upgrade() {
+                    area.queue_draw();
+                }
+            }
+        });
+        area.add_controller(click);
 
         // Middle-button drag pans.
         let middle = gtk::GestureDrag::new();
@@ -774,7 +884,10 @@ impl Canvas {
             move |g, _seq| {
                 let center = g.bounding_box_center().unwrap_or((0.0, 0.0));
                 let mut s = state.borrow_mut();
-                if matches!(&s.interaction, Interaction::Stroke { .. } | Interaction::Erase { .. }) {
+                if matches!(
+                    &s.interaction,
+                    Interaction::Stroke { .. } | Interaction::Erase { .. }
+                ) {
                     return;
                 }
                 s.pinching = true;
@@ -790,9 +903,7 @@ impl Canvas {
             let state = state.clone();
             let area_w = area.downgrade();
             move |g, scale| {
-                let center = g
-                    .bounding_box_center()
-                    .unwrap_or((0.0, 0.0));
+                let center = g.bounding_box_center().unwrap_or((0.0, 0.0));
                 if let Some(area) = area_w.upgrade() {
                     {
                         let mut s = state.borrow_mut();
@@ -838,9 +949,7 @@ impl Canvas {
         area.add_controller(zoom);
 
         // Trackpad / wheel.
-        let scroll = gtk::EventControllerScroll::new(
-            gtk::EventControllerScrollFlags::BOTH_AXES,
-        );
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
         scroll.connect_scroll({
             let state = state.clone();
             let area_w = area.downgrade();
@@ -852,9 +961,8 @@ impl Canvas {
                         s.cursor
                             .unwrap_or((s.width as f64 / 2.0, s.height as f64 / 2.0))
                     };
-                    let zooming = mods.intersects(
-                        gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::META_MASK,
-                    );
+                    let zooming = mods
+                        .intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::META_MASK);
                     {
                         let mut s = state.borrow_mut();
                         if zooming {
@@ -905,11 +1013,37 @@ impl Canvas {
     pub fn set_note(&self, note: Option<Note>, pdf: Option<PdfDoc>) {
         {
             let mut s = self.state.borrow_mut();
+            let mut note = note;
+            if let Some(note) = &mut note {
+                // Keep new ids above anything already persisted in the note.
+                // The process-local counter restarts at 1 on every launch.
+                let max_id = note
+                    .pages
+                    .iter()
+                    .flat_map(|page| page.strokes.iter())
+                    .map(|stroke| stroke.id)
+                    .max()
+                    .unwrap_or(0);
+                NEXT_STROKE_ID.fetch_max(max_id.saturating_add(1), Ordering::Relaxed);
+
+                // Older notes may contain duplicate or missing stroke ids.
+                // Assign stable ids so selection and undo can address strokes.
+                let mut seen = HashSet::new();
+                for page in &mut note.pages {
+                    for stroke in &mut page.strokes {
+                        if stroke.id == 0 || !seen.insert(stroke.id) {
+                            stroke.id = next_stroke_id();
+                            seen.insert(stroke.id);
+                        }
+                    }
+                }
+            }
             s.layout = note.as_ref().map(|n| n.layout()).unwrap_or_default();
             s.note = note;
             s.pdf = pdf;
             s.undo.clear();
             s.redo.clear();
+            s.clear_selection();
             s.interaction = Interaction::None;
             s.cursor = None;
             s.pinching = false;
@@ -987,6 +1121,7 @@ impl Canvas {
                     note.touch();
                 }
                 s.layout = s.note.as_ref().map(|n| n.layout()).unwrap_or_default();
+                s.prune_selection();
             }
             ok
         };
@@ -1013,6 +1148,7 @@ impl Canvas {
                     note.touch();
                 }
                 s.layout = s.note.as_ref().map(|n| n.layout()).unwrap_or_default();
+                s.prune_selection();
             }
             ok
         };
@@ -1025,8 +1161,189 @@ impl Canvas {
     }
 
     pub fn set_tool(&self, tool: Tool) {
-        self.state.borrow_mut().tool = tool;
+        {
+            let mut s = self.state.borrow_mut();
+            s.tool = tool;
+            if tool != Tool::Select {
+                s.clear_selection();
+            }
+        }
         self.area.queue_draw();
+    }
+
+    pub fn clear_selection(&self) {
+        self.state.borrow_mut().clear_selection();
+        self.area.queue_draw();
+    }
+
+    pub fn select_all(&self) {
+        {
+            let mut s = self.state.borrow_mut();
+            let page = s.current_page();
+            let Some(note) = &s.note else { return };
+            let Some(page_data) = note.pages.get(page) else {
+                return;
+            };
+            s.selection = page_data.strokes.iter().map(|stroke| stroke.id).collect();
+            s.selection_page = if s.selection.is_empty() {
+                None
+            } else {
+                Some(page)
+            };
+        }
+        self.area.queue_draw();
+    }
+
+    pub fn copy_selection(&self) -> bool {
+        let mut s = self.state.borrow_mut();
+        let Some(page) = s.selection_page else {
+            return false;
+        };
+        let Some(note) = &s.note else {
+            return false;
+        };
+        let Some(page_data) = note.pages.get(page) else {
+            return false;
+        };
+        let (ox, oy) = s.selection_origin(page);
+        let strokes: Vec<Stroke> = page_data
+            .strokes
+            .iter()
+            .filter(|stroke| s.selection.contains(&stroke.id))
+            .map(|stroke| {
+                let mut stroke = stroke.clone();
+                for point in &mut stroke.points {
+                    point.x -= ox;
+                    point.y -= oy;
+                }
+                stroke
+            })
+            .collect();
+        if strokes.is_empty() {
+            return false;
+        }
+        s.clipboard = strokes;
+        true
+    }
+
+    pub fn paste_clipboard(&self) -> bool {
+        let changed = {
+            let mut s = self.state.borrow_mut();
+            if s.clipboard.is_empty() {
+                return false;
+            }
+            let Some(note_ref) = &s.note else {
+                return false;
+            };
+            let (sx, sy) = s
+                .cursor
+                .unwrap_or((s.width as f64 * 0.5, s.height as f64 * 0.5));
+            let (wx, wy) = s.screen_to_world(sx, sy);
+            let pointer_page = note_ref.page_at(&s.layout, wx, wy);
+            let page = pointer_page.unwrap_or_else(|| s.current_page());
+            let (ox, oy) = s.selection_origin(page);
+            let Some(bounds) = clipboard_bounds(&s.clipboard) else {
+                return false;
+            };
+            let target = s.layout.get(page).copied();
+            let mut dx = if pointer_page == Some(page) {
+                wx - (ox + bounds.x + bounds.w * 0.5)
+            } else {
+                24.0
+            };
+            let mut dy = if pointer_page == Some(page) {
+                wy - (oy + bounds.y + bounds.h * 0.5)
+            } else {
+                24.0
+            };
+            if let Some(rect) = target {
+                let world_bounds = Rect {
+                    x: ox + bounds.x,
+                    y: oy + bounds.y,
+                    ..bounds
+                };
+                (dx, dy) = clamp_translation(world_bounds, rect, dx, dy);
+            }
+            let clipboard = s.clipboard.clone();
+            let Some(note) = &mut s.note else {
+                return false;
+            };
+            let Some(page_data) = note.pages.get_mut(page) else {
+                return false;
+            };
+            let start = page_data.strokes.len();
+            let mut items = Vec::with_capacity(clipboard.len());
+            let mut ids = Vec::with_capacity(clipboard.len());
+            for (offset, original) in clipboard.iter().enumerate() {
+                let mut stroke = original.clone();
+                stroke.id = next_stroke_id();
+                for point in &mut stroke.points {
+                    point.x += ox + dx;
+                    point.y += oy + dy;
+                }
+                ids.push(stroke.id);
+                items.push((start + offset, stroke.clone()));
+                page_data.strokes.push(stroke);
+            }
+            note.touch();
+            s.undo.push(Action::AddStrokes { page, items });
+            s.redo.clear();
+            s.selection = ids;
+            s.selection_page = Some(page);
+            s.invalidate_ink();
+            true
+        };
+        if changed {
+            self.area.queue_draw();
+            emit_view(&self.state);
+            notify_changed(&self.state);
+        }
+        changed
+    }
+
+    pub fn delete_selection(&self) -> bool {
+        let changed = {
+            let mut s = self.state.borrow_mut();
+            let Some(page) = s.selection_page else {
+                return false;
+            };
+            let ids = s.selection.clone();
+            let Some(note) = &mut s.note else {
+                return false;
+            };
+            let Some(page_data) = note.pages.get_mut(page) else {
+                return false;
+            };
+            let mut items = Vec::new();
+            for (index, stroke) in page_data.strokes.iter().enumerate() {
+                if ids.contains(&stroke.id) {
+                    items.push((index, stroke.clone()));
+                }
+            }
+            if items.is_empty() {
+                return false;
+            }
+            page_data.strokes.retain(|stroke| !ids.contains(&stroke.id));
+            note.touch();
+            s.undo.push(Action::Erase { page, items });
+            s.redo.clear();
+            s.clear_selection();
+            s.invalidate_ink();
+            true
+        };
+        if changed {
+            self.area.queue_draw();
+            emit_view(&self.state);
+            notify_changed(&self.state);
+        }
+        changed
+    }
+
+    pub fn cut_selection(&self) -> bool {
+        if !self.copy_selection() {
+            return false;
+        }
+        self.delete_selection()
     }
 
     pub fn set_color(&self, color: &str) {
@@ -1165,7 +1482,11 @@ impl State {
             return false;
         };
         match action {
-            Action::AddStroke { page, index, stroke } => {
+            Action::AddStroke {
+                page,
+                index,
+                stroke,
+            } => {
                 let Some(p) = note.pages.get_mut(*page) else {
                     return false;
                 };
@@ -1217,6 +1538,44 @@ impl State {
                 }
                 true
             }
+            Action::AddStrokes { page, items } => {
+                let Some(p) = note.pages.get_mut(*page) else {
+                    return false;
+                };
+                if forward {
+                    for (index, stroke) in items {
+                        let at = (*index).min(p.strokes.len());
+                        p.strokes.insert(at, stroke.clone());
+                    }
+                } else {
+                    for (_, stroke) in items {
+                        if let Some(pos) = p.strokes.iter().position(|s| s.id == stroke.id) {
+                            p.strokes.remove(pos);
+                        } else {
+                            return false;
+                        }
+                    }
+                }
+                true
+            }
+            Action::MoveStrokes { page, ids, dx, dy } => {
+                let Some(p) = note.pages.get_mut(*page) else {
+                    return false;
+                };
+                let (dx, dy) = if forward { (*dx, *dy) } else { (-*dx, -*dy) };
+                let mut found = false;
+                for stroke in &mut p.strokes {
+                    if !ids.contains(&stroke.id) {
+                        continue;
+                    }
+                    found = true;
+                    for point in &mut stroke.points {
+                        point.x += dx;
+                        point.y += dy;
+                    }
+                }
+                found
+            }
         }
     }
 }
@@ -1267,7 +1626,46 @@ fn stylus_tool_for_event_state(state: gdk::ModifierType) -> Option<Tool> {
     }
 }
 
-fn pointer_down(s: &mut State, x: f64, y: f64, pressure: f64) {
+fn select_click(s: &mut State, x: f64, y: f64, additive: bool) {
+    let (wx, wy) = s.screen_to_world(x, y);
+    let Some(note) = &s.note else {
+        return;
+    };
+    let Some(page) = note.page_at(&s.layout, wx, wy) else {
+        if !additive {
+            s.selection.clear();
+            s.selection_page = None;
+        }
+        return;
+    };
+    if s.selection_page != Some(page) {
+        s.selection.clear();
+        s.selection_page = None;
+    }
+    if let Some(id) =
+        stroke_at(note, page, wx, wy, s.camera.zoom).map(|index| note.pages[page].strokes[index].id)
+    {
+        if additive {
+            if let Some(position) = s.selection.iter().position(|selected| *selected == id) {
+                s.selection.remove(position);
+            } else {
+                s.selection.push(id);
+            }
+        } else {
+            s.selection = vec![id];
+        }
+        s.selection_page = if s.selection.is_empty() {
+            None
+        } else {
+            Some(page)
+        };
+    } else if !additive {
+        s.selection.clear();
+        s.selection_page = None;
+    }
+}
+
+fn pointer_down(s: &mut State, x: f64, y: f64, pressure: f64, additive: bool) {
     if s.note.is_none() || !matches!(&s.interaction, Interaction::None) {
         return;
     }
@@ -1279,11 +1677,17 @@ fn pointer_down(s: &mut State, x: f64, y: f64, pressure: f64) {
         };
         return;
     }
+    if tool == Tool::Eraser {
+        s.clear_selection();
+    }
     let (wx, wy) = s.screen_to_world(x, y);
     let Some(note) = &s.note else {
         return;
     };
     let Some(page) = note.page_at(&s.layout, wx, wy) else {
+        if tool == Tool::Select {
+            s.clear_selection();
+        }
         return;
     };
     let (cx, cy) = note.clamp_to_page(&s.layout, page, wx, wy);
@@ -1316,6 +1720,56 @@ fn pointer_down(s: &mut State, x: f64, y: f64, pressure: f64) {
             let hit = erase_hits(note, page, wx, wy, s.eraser_size / 2.0 / s.camera.zoom);
             s.interaction = Interaction::Erase { page, hit };
         }
+        Tool::Select => {
+            if s.selection_page != Some(page) {
+                s.selection.clear();
+                s.selection_page = None;
+            }
+            let hit = stroke_at(note, page, wx, wy, s.camera.zoom)
+                .map(|index| note.pages[page].strokes[index].id);
+            if let Some(id) = hit {
+                let was_selected = s.selection.contains(&id);
+                if additive {
+                    if was_selected {
+                        s.selection.retain(|selected| *selected != id);
+                        if s.selection.is_empty() {
+                            s.selection_page = None;
+                        }
+                        return;
+                    }
+                    s.selection.push(id);
+                } else if !was_selected {
+                    s.selection = vec![id];
+                }
+                s.selection_page = Some(page);
+                let ids = s.selection.clone();
+                let originals: Vec<(usize, Stroke)> = note.pages[page]
+                    .strokes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, stroke)| ids.contains(&stroke.id))
+                    .map(|(index, stroke)| (index, stroke.clone()))
+                    .collect();
+                s.interaction = Interaction::MoveSelection {
+                    page,
+                    start: (wx, wy),
+                    delta: (0.0, 0.0),
+                    moved: false,
+                    ids,
+                    originals,
+                };
+            } else {
+                if !additive {
+                    s.clear_selection();
+                }
+                s.interaction = Interaction::Select {
+                    page,
+                    start: (wx, wy),
+                    current: (wx, wy),
+                    additive,
+                };
+            }
+        }
         Tool::Hand => {}
     }
 }
@@ -1347,19 +1801,61 @@ fn pointer_move(s: &mut State, x: f64, y: f64, pressure: f64) {
         }
         Interaction::Erase { page, hit } => {
             if let Some(note) = &s.note {
-                let new_hits = erase_hits(
-                    note,
-                    *page,
-                    wx,
-                    wy,
-                    s.eraser_size / 2.0 / s.camera.zoom,
-                );
+                let new_hits = erase_hits(note, *page, wx, wy, s.eraser_size / 2.0 / s.camera.zoom);
                 for index in new_hits {
                     if !hit.contains(&index) {
                         hit.push(index);
                     }
                 }
             }
+        }
+        Interaction::Select { current, .. } => {
+            *current = (wx, wy);
+        }
+        Interaction::MoveSelection {
+            page,
+            start,
+            delta,
+            moved,
+            ids: _,
+            originals,
+        } => {
+            let mut dx = wx - start.0;
+            let mut dy = wy - start.1;
+            let threshold = 2.5 / s.camera.zoom;
+            if !*moved && dx * dx + dy * dy < threshold * threshold {
+                return;
+            }
+            *moved = true;
+            if let Some(rect) = s.layout.get(*page).copied() {
+                if let Some(bounds) = originals
+                    .iter()
+                    .filter_map(|(_, stroke)| stroke_bounds(stroke))
+                    .reduce(union_rect)
+                {
+                    (dx, dy) = clamp_translation(bounds, rect, dx, dy);
+                }
+            }
+            *delta = (dx, dy);
+            if let Some(note) = &mut s.note {
+                if let Some(page_data) = note.pages.get_mut(*page) {
+                    for (index, original) in originals.iter() {
+                        if let Some(stroke) = page_data.strokes.get_mut(*index) {
+                            stroke.points = original
+                                .points
+                                .iter()
+                                .map(|point| Point {
+                                    x: point.x + dx,
+                                    y: point.y + dy,
+                                    p: point.p,
+                                })
+                                .collect();
+                        }
+                    }
+                }
+            }
+            s.path_cache.clear();
+            s.cache_dirty = true;
         }
         Interaction::Pan { start, camera } => {
             s.camera.tx = camera.tx + (x - start.0);
@@ -1376,7 +1872,11 @@ fn pointer_up(s: &mut State, x: f64, y: f64, _pressure: f64) -> bool {
         Interaction::Stroke { page, mut stroke } => {
             if stroke.points.len() == 1 {
                 let p = stroke.points[0].clone();
-                stroke.points.push(Point { x: p.x + 0.01, y: p.y + 0.01, p: p.p });
+                stroke.points.push(Point {
+                    x: p.x + 0.01,
+                    y: p.y + 0.01,
+                    p: p.p,
+                });
             }
             let Some(note) = &mut s.note else {
                 return false;
@@ -1399,13 +1899,7 @@ fn pointer_up(s: &mut State, x: f64, y: f64, _pressure: f64) -> bool {
         Interaction::Erase { page, mut hit } => {
             let (wx, wy) = s.screen_to_world(x, y);
             if let Some(note) = &s.note {
-                let new_hits = erase_hits(
-                    note,
-                    page,
-                    wx,
-                    wy,
-                    s.eraser_size / 2.0 / s.camera.zoom,
-                );
+                let new_hits = erase_hits(note, page, wx, wy, s.eraser_size / 2.0 / s.camera.zoom);
                 for index in new_hits {
                     if !hit.contains(&index) {
                         hit.push(index);
@@ -1436,6 +1930,69 @@ fn pointer_up(s: &mut State, x: f64, y: f64, _pressure: f64) -> bool {
             }
             note.touch();
             s.undo.push(Action::Erase { page, items });
+            s.redo.clear();
+            s.invalidate_ink();
+            true
+        }
+        Interaction::Select {
+            page,
+            start,
+            current,
+            additive,
+        } => {
+            let rect = rect_from_points(start, current);
+            let threshold = 3.0 / s.camera.zoom;
+            if rect.w >= threshold || rect.h >= threshold {
+                let ids: Vec<u64> = {
+                    let Some(note) = &s.note else {
+                        return false;
+                    };
+                    let Some(page_data) = note.pages.get(page) else {
+                        return false;
+                    };
+                    page_data
+                        .strokes
+                        .iter()
+                        .filter(|stroke| stroke_intersects_rect(stroke, rect))
+                        .map(|stroke| stroke.id)
+                        .collect()
+                };
+                if additive {
+                    for id in ids {
+                        if !s.selection.contains(&id) {
+                            s.selection.push(id);
+                        }
+                    }
+                } else {
+                    s.selection = ids;
+                }
+                s.selection_page = if s.selection.is_empty() {
+                    None
+                } else {
+                    Some(page)
+                };
+            }
+            false
+        }
+        Interaction::MoveSelection {
+            page,
+            moved,
+            delta,
+            ids,
+            ..
+        } => {
+            if !moved {
+                return false;
+            }
+            if let Some(note) = &mut s.note {
+                note.touch();
+            }
+            s.undo.push(Action::MoveStrokes {
+                page,
+                ids,
+                dx: delta.0,
+                dy: delta.1,
+            });
             s.redo.clear();
             s.invalidate_ink();
             true
@@ -1488,6 +2045,138 @@ fn segment_dist2(x1: f64, y1: f64, x2: f64, y2: f64, x: f64, y: f64) -> f64 {
     let px = x1 + t * dx;
     let py = y1 + t * dy;
     (x - px).powi(2) + (y - py).powi(2)
+}
+
+fn rect_from_points(a: (f64, f64), b: (f64, f64)) -> Rect {
+    Rect {
+        x: a.0.min(b.0),
+        y: a.1.min(b.1),
+        w: (a.0 - b.0).abs(),
+        h: (a.1 - b.1).abs(),
+    }
+}
+
+fn stroke_bounds(stroke: &Stroke) -> Option<Rect> {
+    let first = stroke.points.first()?;
+    let margin = stroke.width.max(0.4) * 0.5;
+    let mut min_x = first.x - margin;
+    let mut max_x = first.x + margin;
+    let mut min_y = first.y - margin;
+    let mut max_y = first.y + margin;
+    for point in &stroke.points[1..] {
+        min_x = min_x.min(point.x - margin);
+        max_x = max_x.max(point.x + margin);
+        min_y = min_y.min(point.y - margin);
+        max_y = max_y.max(point.y + margin);
+    }
+    Some(Rect {
+        x: min_x,
+        y: min_y,
+        w: max_x - min_x,
+        h: max_y - min_y,
+    })
+}
+
+fn stroke_intersects_rect(stroke: &Stroke, rect: Rect) -> bool {
+    let Some(bounds) = stroke_bounds(stroke) else {
+        return false;
+    };
+    if !bounds.intersects(rect.x, rect.y, rect.w, rect.h) {
+        return false;
+    }
+    if stroke.points.len() == 1 {
+        let p = &stroke.points[0];
+        return rect.contains(p.x, p.y);
+    }
+    for pair in stroke.points.windows(2) {
+        if segment_rect_intersects(pair[0].x, pair[0].y, pair[1].x, pair[1].y, rect) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Liang-Barsky segment/rectangle clipping test.
+fn segment_rect_intersects(x1: f64, y1: f64, x2: f64, y2: f64, rect: Rect) -> bool {
+    if rect.contains(x1, y1) || rect.contains(x2, y2) {
+        return true;
+    }
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let p = [-dx, dx, -dy, dy];
+    let q = [
+        x1 - rect.x,
+        rect.x + rect.w - x1,
+        y1 - rect.y,
+        rect.y + rect.h - y1,
+    ];
+    let mut t0 = 0.0_f64;
+    let mut t1 = 1.0_f64;
+    for i in 0..4 {
+        if p[i].abs() < 1e-12 {
+            if q[i] < 0.0 {
+                return false;
+            }
+        } else {
+            let t = q[i] / p[i];
+            if p[i] < 0.0 {
+                t0 = t0.max(t);
+            } else {
+                t1 = t1.min(t);
+            }
+            if t0 > t1 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn stroke_at(note: &Note, page: usize, x: f64, y: f64, zoom: f64) -> Option<usize> {
+    let page_data = note.pages.get(page)?;
+    let threshold = 7.0 / zoom;
+    page_data
+        .strokes
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, stroke)| stroke_hit(stroke, x, y, threshold + stroke.width * 0.5))
+        .map(|(index, _)| index)
+}
+
+fn union_rect(a: Rect, b: Rect) -> Rect {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    let right = (a.x + a.w).max(b.x + b.w);
+    let bottom = (a.y + a.h).max(b.y + b.h);
+    Rect {
+        x,
+        y,
+        w: right - x,
+        h: bottom - y,
+    }
+}
+
+fn clipboard_bounds(strokes: &[Stroke]) -> Option<Rect> {
+    strokes.iter().filter_map(stroke_bounds).reduce(union_rect)
+}
+
+fn clamp_translation(bounds: Rect, target: Rect, dx: f64, dy: f64) -> (f64, f64) {
+    let min_dx = target.x + 1.0 - bounds.x;
+    let max_dx = target.x + target.w - 1.0 - (bounds.x + bounds.w);
+    let min_dy = target.y + 1.0 - bounds.y;
+    let max_dy = target.y + target.h - 1.0 - (bounds.y + bounds.h);
+    let clamp_axis = |value: f64, min: f64, max: f64| {
+        if min > max {
+            (min + max) * 0.5
+        } else {
+            value.clamp(min, max)
+        }
+    };
+    (
+        clamp_axis(dx, min_dx, max_dx),
+        clamp_axis(dy, min_dy, max_dy),
+    )
 }
 
 #[allow(unused_must_use)]
@@ -1597,14 +2286,8 @@ impl State {
     }
 
     fn draw_infinite_background(&self, ctx: &Context, w: f64, h: f64) {
-        let gradient = cairo::RadialGradient::new(
-            w * 0.5,
-            h * 0.42,
-            0.0,
-            w * 0.5,
-            h * 0.42,
-            w.max(h) * 0.85,
-        );
+        let gradient =
+            cairo::RadialGradient::new(w * 0.5, h * 0.42, 0.0, w * 0.5, h * 0.42, w.max(h) * 0.85);
         gradient.add_color_stop_rgb(0.0, 0.988, 0.984, 0.969);
         gradient.add_color_stop_rgb(0.65, 0.973, 0.967, 0.949);
         gradient.add_color_stop_rgb(1.0, 0.949, 0.942, 0.922);
@@ -1634,16 +2317,18 @@ impl State {
     fn draw_page_card(&mut self, ctx: &Context, index: usize, rect: Rect, dark: bool) {
         let radius = 7.0;
         // Soft shadow.
-        ctx.set_source_rgba(
-            0.0,
-            0.0,
-            0.0,
-            if dark { 0.42 } else { 0.075 },
-        );
+        ctx.set_source_rgba(0.0, 0.0, 0.0, if dark { 0.42 } else { 0.075 });
         rounded_rect(ctx, rect.x + 1.0, rect.y + 6.0, rect.w, rect.h, radius);
         let _ = ctx.fill();
         ctx.set_source_rgba(0.0, 0.0, 0.0, if dark { 0.18 } else { 0.035 });
-        rounded_rect(ctx, rect.x - 4.0, rect.y + 10.0, rect.w + 8.0, rect.h, radius + 6.0);
+        rounded_rect(
+            ctx,
+            rect.x - 4.0,
+            rect.y + 10.0,
+            rect.w + 8.0,
+            rect.h,
+            radius + 6.0,
+        );
         let _ = ctx.fill();
 
         // Paper.
@@ -1683,7 +2368,14 @@ impl State {
         // Hairline border.
         ctx.set_source_rgba(0.0, 0.0, 0.0, if dark { 0.25 } else { 0.05 });
         ctx.set_line_width(1.0 / self.camera.zoom);
-        rounded_rect(ctx, rect.x + 0.5, rect.y + 0.5, rect.w - 1.0, rect.h - 1.0, radius);
+        rounded_rect(
+            ctx,
+            rect.x + 0.5,
+            rect.y + 0.5,
+            rect.w - 1.0,
+            rect.h - 1.0,
+            radius,
+        );
         let _ = ctx.stroke();
     }
 
@@ -1716,9 +2408,7 @@ impl State {
             return;
         };
         let target = (self.camera.zoom * sf).clamp(0.45, 2.5);
-        if self.pdf_scale <= 0.0
-            || target > self.pdf_scale * 1.25
-            || target < self.pdf_scale * 0.42
+        if self.pdf_scale <= 0.0 || target > self.pdf_scale * 1.25 || target < self.pdf_scale * 0.42
         {
             self.pdf_pages.clear();
             self.pdf_scale = target;
@@ -1797,12 +2487,8 @@ impl State {
             return;
         }
         let live = match &self.interaction {
-            Interaction::Stroke { page, stroke } => {
-                Some((*page, LiveItem::Stroke(stroke.clone())))
-            }
-            Interaction::Erase { page, hit } => {
-                Some((*page, LiveItem::Erase(hit.clone())))
-            }
+            Interaction::Stroke { page, stroke } => Some((*page, LiveItem::Stroke(stroke.clone()))),
+            Interaction::Erase { page, hit } => Some((*page, LiveItem::Erase(hit.clone()))),
             _ => None,
         };
         // Live stroke / eraser feedback in world space.
@@ -1816,7 +2502,11 @@ impl State {
                 .as_ref()
                 .map(|n| n.kind == NoteKind::Infinite)
                 .unwrap_or(false);
-            let clip = if infinite { None } else { self.layout.get(page).copied() };
+            let clip = if infinite {
+                None
+            } else {
+                self.layout.get(page).copied()
+            };
             if let Some(rect) = clip {
                 ctx.save();
                 rounded_rect(ctx, rect.x, rect.y, rect.w, rect.h, 7.0);
@@ -1858,7 +2548,96 @@ impl State {
                 ctx.restore();
             }
         }
+
+        let mut selected_bounds: Option<Rect> = None;
+        if let Some(page) = self.selection_page {
+            let indices = self.selection_indices(page);
+            if !indices.is_empty() {
+                let infinite = self
+                    .note
+                    .as_ref()
+                    .map(|n| n.kind == NoteKind::Infinite)
+                    .unwrap_or(false);
+                let clip = if infinite {
+                    None
+                } else {
+                    self.layout.get(page).copied()
+                };
+                if let Some(rect) = clip {
+                    ctx.save();
+                    rounded_rect(ctx, rect.x, rect.y, rect.w, rect.h, 7.0);
+                    ctx.clip();
+                    ctx.new_path();
+                }
+                for index in &indices {
+                    self.ensure_path(page, *index);
+                }
+                if let Some(note) = &self.note {
+                    if let Some(page_data) = note.pages.get(page) {
+                        let mut bounds: Option<Rect> = None;
+                        for index in &indices {
+                            if let Some(stroke) = page_data.strokes.get(*index) {
+                                if let Some(stroke_bounds) = stroke_bounds(stroke) {
+                                    bounds = Some(match bounds {
+                                        None => stroke_bounds,
+                                        Some(current) => union_rect(current, stroke_bounds),
+                                    });
+                                }
+                                if let Some(path) = self.path_cache.get(&(page, *index)) {
+                                    ctx.new_path();
+                                    ctx.append_path(path);
+                                    ctx.set_line_width((stroke.width + 5.0 / zoom).max(1.0));
+                                    ctx.set_line_cap(cairo::LineCap::Round);
+                                    ctx.set_line_join(cairo::LineJoin::Round);
+                                    ctx.set_source_rgba(0.20, 0.48, 0.95, 0.28);
+                                    let _ = ctx.stroke();
+                                }
+                            }
+                        }
+                        selected_bounds = bounds;
+                    }
+                }
+                if clip.is_some() {
+                    ctx.restore();
+                }
+            }
+        }
         ctx.restore();
+
+        if let Some(bounds) = selected_bounds {
+            let rect = Rect {
+                x: bounds.x * zoom + tx - 4.0,
+                y: bounds.y * zoom + ty - 4.0,
+                w: bounds.w * zoom + 8.0,
+                h: bounds.h * zoom + 8.0,
+            };
+            ctx.set_source_rgba(0.20, 0.48, 0.95, 0.07);
+            rounded_rect(ctx, rect.x, rect.y, rect.w, rect.h, 5.0);
+            let _ = ctx.fill();
+            ctx.set_source_rgba(0.20, 0.48, 0.95, 0.9);
+            ctx.set_line_width(1.2);
+            ctx.set_dash(&[5.0, 4.0], 0.0);
+            rounded_rect(ctx, rect.x, rect.y, rect.w, rect.h, 5.0);
+            let _ = ctx.stroke();
+            ctx.set_dash(&[], 0.0);
+        }
+
+        if let Interaction::Select { start, current, .. } = &self.interaction {
+            let rect = rect_from_points(*start, *current);
+            let sx = rect.x * zoom + tx;
+            let sy = rect.y * zoom + ty;
+            let sw = rect.w * zoom;
+            let sh = rect.h * zoom;
+            ctx.set_source_rgba(0.20, 0.48, 0.95, 0.09);
+            ctx.rectangle(sx, sy, sw, sh);
+            let _ = ctx.fill();
+            ctx.set_source_rgba(0.20, 0.48, 0.95, 0.9);
+            ctx.set_line_width(1.2);
+            ctx.set_dash(&[5.0, 4.0], 0.0);
+            ctx.rectangle(sx, sy, sw, sh);
+            let _ = ctx.stroke();
+            ctx.set_dash(&[], 0.0);
+        }
 
         // Cursor.
         if let Some((x, y)) = self.cursor {
@@ -1871,6 +2650,7 @@ impl State {
                     Tool::Pen => (self.pen_size * zoom * 0.5).max(2.0),
                     Tool::Highlighter => (self.highlighter_size * zoom * 0.5).max(4.0),
                     Tool::Eraser => self.eraser_size * 0.5,
+                    Tool::Select => 4.0,
                     Tool::Hand => 7.0,
                 }
             };
@@ -2060,3 +2840,80 @@ fn catmull_centripetal(p0: Point, p1: Point, p2: Point, p3: Point, t: f64) -> (f
     (c.x, c.y)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with_stroke() -> State {
+        let mut state = State::new();
+        let mut note = Note::new(NoteKind::Infinite, "test");
+        note.pages[0].strokes.push(Stroke {
+            id: 1,
+            tool: StrokeTool::Pen,
+            color: "#000000".into(),
+            width: 4.0,
+            points: vec![
+                Point {
+                    x: 10.0,
+                    y: 10.0,
+                    p: 0.5,
+                },
+                Point {
+                    x: 20.0,
+                    y: 20.0,
+                    p: 0.5,
+                },
+            ],
+        });
+        state.layout = note.layout();
+        state.note = Some(note);
+        state.tool = Tool::Select;
+        state
+    }
+
+    #[test]
+    fn tap_selects_a_stroke() {
+        let mut state = state_with_stroke();
+        pointer_down(&mut state, 15.0, 15.0, 0.5, false);
+        pointer_up(&mut state, 15.0, 15.0, 0.5);
+        assert_eq!(state.selection, vec![1]);
+        assert_eq!(state.selection_page, Some(0));
+    }
+
+    #[test]
+    fn marquee_selects_intersecting_strokes() {
+        let mut state = state_with_stroke();
+        pointer_down(&mut state, 0.0, 0.0, 0.5, false);
+        pointer_move(&mut state, 30.0, 30.0, 0.5);
+        pointer_up(&mut state, 30.0, 30.0, 0.5);
+        assert_eq!(state.selection, vec![1]);
+    }
+
+    #[test]
+    fn dragging_selection_moves_and_undoes() {
+        let mut state = state_with_stroke();
+        pointer_down(&mut state, 15.0, 15.0, 0.5, false);
+        pointer_move(&mut state, 35.0, 25.0, 0.5);
+        assert!(pointer_up(&mut state, 35.0, 25.0, 0.5));
+        let stroke = &state.note.as_ref().unwrap().pages[0].strokes[0];
+        assert!((stroke.points[0].x - 30.0).abs() < 1e-9);
+        assert!((stroke.points[0].y - 20.0).abs() < 1e-9);
+        let action = state.undo.pop().unwrap();
+        assert!(state.apply_action(&action, false));
+        let stroke = &state.note.as_ref().unwrap().pages[0].strokes[0];
+        assert!((stroke.points[0].x - 10.0).abs() < 1e-9);
+        assert!((stroke.points[0].y - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn segment_rect_intersection_handles_crossing() {
+        let rect = Rect {
+            x: 5.0,
+            y: 5.0,
+            w: 10.0,
+            h: 10.0,
+        };
+        assert!(segment_rect_intersects(0.0, 0.0, 20.0, 20.0, rect));
+        assert!(!segment_rect_intersects(0.0, 20.0, 20.0, 20.0, rect));
+    }
+}
