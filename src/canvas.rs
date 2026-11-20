@@ -1249,6 +1249,7 @@ fn draw(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>, ctx: &Context, w: i
                 ImageSurface::create(Format::ARgb32, (w * sf).max(1), (h * sf).max(1))
             {
                 if let Ok(cache_ctx) = Context::new(&surface) {
+                    cache_ctx.set_antialias(cairo::Antialias::Best);
                     cache_ctx.scale(sf as f64, sf as f64);
                     s.draw_scene(&cache_ctx, w as f64, h as f64, sf as f64);
                     s.cache = Some(surface);
@@ -1674,18 +1675,38 @@ fn build_stroke_path(ctx: &Context, stroke: &Stroke) {
     let (sx, sy, sw) = samples[0];
     let (ex, ey, ew) = samples[n - 1];
 
-    ctx.move_to(left[0].0, left[0].1);
-    for p in &left[1..] {
-        ctx.line_to(p.0, p.1);
-    }
+    append_smooth_polyline(ctx, &left);
     let a_left = (left[n - 1].1 - ey).atan2(left[n - 1].0 - ex);
     ctx.arc_negative(ex, ey, (ew * 0.5).max(0.35), a_left, a_left - PI);
-    for p in right.iter().rev() {
-        ctx.line_to(p.0, p.1);
-    }
+    let right_rev: Vec<(f64, f64)> = right.iter().rev().copied().collect();
+    append_smooth_polyline(ctx, &right_rev);
     let a_right = (right[0].1 - sy).atan2(right[0].0 - sx);
     ctx.arc_negative(sx, sy, (sw * 0.5).max(0.35), a_right, a_right - PI);
     ctx.close_path();
+}
+
+/// Append a Catmull-Rom spline through the points as cubic Beziers.
+/// The stroke outline is densely sampled, so using straight line segments
+/// between offset points leaves visible facets when zoomed in.
+fn append_smooth_polyline(ctx: &Context, points: &[(f64, f64)]) {
+    if points.is_empty() {
+        return;
+    }
+    ctx.move_to(points[0].0, points[0].1);
+    if points.len() == 1 {
+        return;
+    }
+    for i in 1..points.len() {
+        let p0 = points[i.saturating_sub(2)];
+        let p1 = points[i - 1];
+        let p2 = points[i];
+        let p3 = points[(i + 1).min(points.len() - 1)];
+        let c1x = p1.0 + (p2.0 - p0.0) / 6.0;
+        let c1y = p1.1 + (p2.1 - p0.1) / 6.0;
+        let c2x = p2.0 - (p3.0 - p1.0) / 6.0;
+        let c2y = p2.1 - (p3.1 - p1.1) / 6.0;
+        ctx.curve_to(c1x, c1y, c2x, c2y, p2.0, p2.1);
+    }
 }
 
 fn stroke_samples(stroke: &Stroke) -> Vec<(f64, f64, f64)> {
