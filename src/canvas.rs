@@ -1677,7 +1677,7 @@ fn append_smooth_polyline(ctx: &Context, points: &[(f64, f64)]) {
 }
 
 fn stroke_samples(stroke: &Stroke) -> Vec<(f64, f64)> {
-    let points = &stroke.points;
+    let points = smooth_points(&stroke.points);
     if points.is_empty() {
         return Vec::new();
     }
@@ -1704,6 +1704,34 @@ fn stroke_samples(stroke: &Stroke) -> Vec<(f64, f64)> {
     }
     let last = points[n - 1];
     out.push((last.x, last.y));
+    out
+}
+
+/// Smooth sparse, uneven pen samples before interpolation. Fast strokes
+/// produce fewer points per distance, so a light moving average removes the
+/// angular kinks that would otherwise survive the spline.
+fn smooth_points(points: &[Point]) -> Vec<Point> {
+    if points.len() <= 2 {
+        return points.to_vec();
+    }
+
+    let mut spacing = 0.0;
+    for pair in points.windows(2) {
+        let dx = pair[1].x - pair[0].x;
+        let dy = pair[1].y - pair[0].y;
+        spacing += (dx * dx + dy * dy).sqrt();
+    }
+    spacing /= (points.len() - 1) as f64;
+    let passes = if spacing > 6.0 { 2 } else { 1 };
+
+    let mut out = points.to_vec();
+    for _ in 0..passes {
+        let src = out.clone();
+        for i in 1..src.len() - 1 {
+            out[i].x = src[i - 1].x * 0.25 + src[i].x * 0.5 + src[i + 1].x * 0.25;
+            out[i].y = src[i - 1].y * 0.25 + src[i].y * 0.5 + src[i + 1].y * 0.25;
+        }
+    }
     out
 }
 
