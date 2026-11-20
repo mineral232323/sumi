@@ -62,12 +62,30 @@ cargo build --release
 
 ## インストール
 
+### リポジトリから
+
 ```sh
 ./install.sh
 ```
 
 `~/.local/bin/sumi` にバイナリ、`~/.local/share/applications/` にデスクトップエントリ、
 `~/.local/share/icons/hicolor/scalable/apps/` にアイコンを配置します。
+
+### curl で一発
+
+Rust と GTK / Poppler の開発パッケージが入っていれば、リポジトリを一時ディレクトリに取得して
+ビルド・インストールまで行えます。
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mineral232323/sumi/main/get.sh | sh
+```
+
+別のブランチやタグを使う場合:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mineral232323/sumi/main/get.sh \
+  | SUMI_REF=v0.1.0 sh
+```
 
 ## ショートカット
 
