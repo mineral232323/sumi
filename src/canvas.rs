@@ -4,7 +4,7 @@ use std::f64::consts::{PI, TAU};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cairo::{Context, FillRule, FontSlant, FontWeight, Format, ImageSurface, Path};
+use cairo::{Context, FontSlant, FontWeight, Format, ImageSurface, Path};
 use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
@@ -1623,7 +1623,10 @@ fn paint_stroke(ctx: &Context, stroke: &Stroke, path: &Path, alpha: f64) {
     }
     ctx.new_path();
     ctx.append_path(path);
-    let _ = ctx.fill();
+    ctx.set_line_width(stroke.width.max(0.4));
+    ctx.set_line_cap(cairo::LineCap::Round);
+    ctx.set_line_join(cairo::LineJoin::Round);
+    let _ = ctx.stroke();
 }
 
 fn rounded_rect(ctx: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
@@ -1641,53 +1644,17 @@ fn build_stroke_path(ctx: &Context, stroke: &Stroke) {
     if samples.is_empty() {
         return;
     }
-    ctx.set_fill_rule(FillRule::Winding);
     if samples.len() == 1 {
-        let (x, y, w) = samples[0];
-        ctx.arc(x, y, (w * 0.5).max(0.35), 0.0, TAU);
+        let (x, y) = samples[0];
+        // A tiny segment plus round caps renders as a dot.
+        ctx.move_to(x, y);
+        ctx.line_to(x + 0.01, y);
         return;
     }
-
-    let n = samples.len();
-    let mut left = Vec::with_capacity(n);
-    let mut right = Vec::with_capacity(n);
-    for i in 0..n {
-        let (x, y, w) = samples[i];
-        let prev = samples[i.saturating_sub(1)];
-        let next = samples[(i + 1).min(n - 1)];
-        let mut tx = next.0 - prev.0;
-        let mut ty = next.1 - prev.1;
-        let len = (tx * tx + ty * ty).sqrt();
-        if len < 1e-6 {
-            tx = 1.0;
-            ty = 0.0;
-        } else {
-            tx /= len;
-            ty /= len;
-        }
-        let nx = -ty;
-        let ny = tx;
-        let r = (w * 0.5).max(0.35);
-        left.push((x + nx * r, y + ny * r));
-        right.push((x - nx * r, y - ny * r));
-    }
-
-    let (sx, sy, sw) = samples[0];
-    let (ex, ey, ew) = samples[n - 1];
-
-    append_smooth_polyline(ctx, &left);
-    let a_left = (left[n - 1].1 - ey).atan2(left[n - 1].0 - ex);
-    ctx.arc_negative(ex, ey, (ew * 0.5).max(0.35), a_left, a_left - PI);
-    let right_rev: Vec<(f64, f64)> = right.iter().rev().copied().collect();
-    append_smooth_polyline(ctx, &right_rev);
-    let a_right = (right[0].1 - sy).atan2(right[0].0 - sx);
-    ctx.arc_negative(sx, sy, (sw * 0.5).max(0.35), a_right, a_right - PI);
-    ctx.close_path();
+    append_smooth_polyline(ctx, &samples);
 }
 
 /// Append a Catmull-Rom spline through the points as cubic Beziers.
-/// The stroke outline is densely sampled, so using straight line segments
-/// between offset points leaves visible facets when zoomed in.
 fn append_smooth_polyline(ctx: &Context, points: &[(f64, f64)]) {
     if points.is_empty() {
         return;
@@ -1709,14 +1676,13 @@ fn append_smooth_polyline(ctx: &Context, points: &[(f64, f64)]) {
     }
 }
 
-fn stroke_samples(stroke: &Stroke) -> Vec<(f64, f64, f64)> {
+fn stroke_samples(stroke: &Stroke) -> Vec<(f64, f64)> {
     let points = &stroke.points;
     if points.is_empty() {
         return Vec::new();
     }
-    let width = stroke.width.max(0.4);
     if points.len() == 1 {
-        return vec![(points[0].x, points[0].y, width)];
+        return vec![(points[0].x, points[0].y)];
     }
 
     let mut out = Vec::new();
@@ -1729,25 +1695,47 @@ fn stroke_samples(stroke: &Stroke) -> Vec<(f64, f64, f64)> {
         let dx = p2.x - p1.x;
         let dy = p2.y - p1.y;
         let dist = (dx * dx + dy * dy).sqrt();
-        let steps = ((dist / 1.35).ceil() as usize).clamp(1, 40);
+        // Dense sampling plus a centripetal spline keeps fast strokes smooth.
+        let steps = ((dist / 0.8).ceil() as usize).clamp(1, 240);
         for step in 0..steps {
             let t = step as f64 / steps as f64;
-            let x = catmull(p0.x, p1.x, p2.x, p3.x, t);
-            let y = catmull(p0.y, p1.y, p2.y, p3.y, t);
-            out.push((x, y, width));
+            out.push(catmull_centripetal(p0, p1, p2, p3, t));
         }
     }
     let last = points[n - 1];
-    out.push((last.x, last.y, width));
+    out.push((last.x, last.y));
     out
 }
 
-fn catmull(p0: f64, p1: f64, p2: f64, p3: f64, t: f64) -> f64 {
-    let t2 = t * t;
-    let t3 = t2 * t;
-    0.5 * ((2.0 * p1)
-        + (-p0 + p2) * t
-        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
-        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
+/// Centripetal Catmull-Rom interpolation. Unlike the uniform variant, this
+/// avoids cusps and overshoot when pen samples are unevenly spaced, which is
+/// exactly what happens when writing quickly.
+fn catmull_centripetal(p0: Point, p1: Point, p2: Point, p3: Point, t: f64) -> (f64, f64) {
+    fn knot(a: Point, b: Point) -> f64 {
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        (dx * dx + dy * dy).sqrt().sqrt().max(1e-4)
+    }
+    fn lerp(a: Point, b: Point, t: f64) -> Point {
+        Point {
+            x: a.x + (b.x - a.x) * t,
+            y: a.y + (b.y - a.y) * t,
+            p: 1.0,
+        }
+    }
+
+    let t0 = 0.0;
+    let t1 = t0 + knot(p0, p1);
+    let t2 = t1 + knot(p1, p2);
+    let t3 = t2 + knot(p2, p3);
+    let tt = t1 + (t2 - t1) * t;
+
+    let a1 = lerp(p0, p1, (tt - t0) / (t1 - t0));
+    let a2 = lerp(p1, p2, (tt - t1) / (t2 - t1));
+    let a3 = lerp(p2, p3, (tt - t2) / (t3 - t2));
+    let b1 = lerp(a1, a2, (tt - t0) / (t2 - t0));
+    let b2 = lerp(a2, a3, (tt - t1) / (t3 - t1));
+    let c = lerp(b1, b2, (tt - t1) / (t2 - t1));
+    (c.x, c.y)
 }
 
