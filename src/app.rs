@@ -1,10 +1,12 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::f64::consts::{PI, TAU};
 use std::rc::Rc;
 use std::time::Duration;
 
 use gtk::gdk;
 use gtk::glib;
+use gtk::glib::translate::IntoGlib;
 use gtk::prelude::*;
 use gtk::{pango, Orientation};
 use libadwaita as adw;
@@ -54,6 +56,123 @@ impl Toolbar {
             Tool::Eraser => &self.eraser,
             Tool::Hand => &self.hand,
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WheelAction {
+    Tool(Tool),
+    Undo,
+    Redo,
+}
+
+struct WheelButton {
+    button: gtk::Button,
+    action: WheelAction,
+}
+
+const WHEEL_SIZE: i32 = 268;
+const WHEEL_RADIUS: f64 = 92.0;
+const WHEEL_BUTTON: i32 = 50;
+const WHEEL_CENTER: i32 = 42;
+
+struct ToolWheel {
+    root: gtk::Fixed,
+    circle: gtk::Overlay,
+    buttons: Vec<WheelButton>,
+    center: gtk::Button,
+    position: Rc<Cell<(f64, f64)>>,
+}
+
+impl ToolWheel {
+    fn new() -> Self {
+        let root = gtk::Fixed::new();
+        root.set_hexpand(true);
+        root.set_vexpand(true);
+        root.set_halign(gtk::Align::Fill);
+        root.set_valign(gtk::Align::Fill);
+        root.set_can_target(true);
+        root.set_visible(false);
+
+        let circle = gtk::Overlay::new();
+        circle.add_css_class("sumi-wheel");
+        circle.set_size_request(WHEEL_SIZE, WHEEL_SIZE);
+        circle.set_can_target(true);
+
+        let layout = gtk::Fixed::new();
+        circle.set_child(Some(&layout));
+
+        // Add new wheel entries here. The layout distributes them evenly.
+        let entries = [
+            ("sumi-pen-symbolic", "ペン", WheelAction::Tool(Tool::Pen)),
+            (
+                "sumi-highlighter-symbolic",
+                "マーカー",
+                WheelAction::Tool(Tool::Highlighter),
+            ),
+            ("sumi-eraser-symbolic", "消しゴム", WheelAction::Tool(Tool::Eraser)),
+            ("sumi-hand-symbolic", "手のひら", WheelAction::Tool(Tool::Hand)),
+            ("edit-undo-symbolic", "元に戻す", WheelAction::Undo),
+            ("edit-redo-symbolic", "やり直す", WheelAction::Redo),
+        ];
+
+        let count = entries.len() as f64;
+        let center = WHEEL_SIZE as f64 / 2.0;
+        let mut buttons = Vec::new();
+        for (index, (icon, label, action)) in entries.into_iter().enumerate() {
+            let angle = -PI / 2.0 + TAU * index as f64 / count;
+            let button = gtk::Button::from_icon_name(icon);
+            button.add_css_class("wheel-item");
+            button.set_size_request(WHEEL_BUTTON, WHEEL_BUTTON);
+            button.set_tooltip_text(Some(label));
+            button.set_focus_on_click(false);
+            layout.put(
+                &button,
+                center + WHEEL_RADIUS * angle.cos() - WHEEL_BUTTON as f64 / 2.0,
+                center + WHEEL_RADIUS * angle.sin() - WHEEL_BUTTON as f64 / 2.0,
+            );
+            buttons.push(WheelButton { button, action });
+        }
+
+        let center_button = gtk::Button::from_icon_name("window-close-symbolic");
+        center_button.add_css_class("wheel-center");
+        center_button.set_size_request(WHEEL_CENTER, WHEEL_CENTER);
+        center_button.set_tooltip_text(Some("閉じる"));
+        center_button.set_focus_on_click(false);
+        layout.put(
+            &center_button,
+            center - WHEEL_CENTER as f64 / 2.0,
+            center - WHEEL_CENTER as f64 / 2.0,
+        );
+
+        root.put(&circle, 0.0, 0.0);
+
+        Self {
+            root,
+            circle,
+            buttons,
+            center: center_button,
+            position: Rc::new(Cell::new((0.0, 0.0))),
+        }
+    }
+
+    fn open(&self, x: f64, y: f64, width: f64, height: f64) {
+        let size = WHEEL_SIZE as f64;
+        let max_x = (width - size).max(0.0);
+        let max_y = (height - size).max(0.0);
+        let px = (x - size / 2.0).clamp(0.0, max_x);
+        let py = (y - size / 2.0).clamp(0.0, max_y);
+        self.position.set((px, py));
+        self.root.move_(&self.circle, px, py);
+        self.root.set_visible(true);
+    }
+
+    fn close(&self) {
+        self.root.set_visible(false);
+    }
+
+    fn is_open(&self) -> bool {
+        self.root.is_visible()
     }
 }
 
@@ -121,6 +240,7 @@ struct App {
     sidebar_toggle: gtk::ToggleButton,
     undo_btn: gtk::Button,
     redo_btn: gtk::Button,
+    wheel: ToolWheel,
     content_menu: gtk::MenuButton,
     add_menu: gtk::MenuButton,
     toolbar: Toolbar,
@@ -175,11 +295,14 @@ pub fn build(application: &adw::Application) {
     zoom_pill.set_margin_end(18);
     zoom_pill.set_margin_bottom(18);
 
+    let wheel = ToolWheel::new();
+
     let canvas_overlay = gtk::Overlay::new();
     canvas_overlay.set_child(Some(&canvas.area));
     canvas_overlay.add_overlay(&toolbar.root);
     canvas_overlay.add_overlay(&page_pill);
     canvas_overlay.add_overlay(&zoom_pill);
+    canvas_overlay.add_overlay(&wheel.root);
     canvas_overlay.set_hexpand(true);
     canvas_overlay.set_vexpand(true);
 
@@ -310,6 +433,7 @@ pub fn build(application: &adw::Application) {
         sidebar_toggle,
         undo_btn,
         redo_btn,
+        wheel,
         content_menu,
         add_menu,
         toolbar,
@@ -774,24 +898,154 @@ impl App {
         }
 
         self.wire_shortcuts();
+        self.wire_tool_wheel();
         self.apply_tool(Tool::Pen);
         self.reload();
+    }
+
+    fn wire_tool_wheel(self: &Rc<Self>) {
+        for item in &self.wheel.buttons {
+            let weak = Rc::downgrade(self);
+            let action = item.action;
+            item.button.connect_clicked(move |_| {
+                if let Some(app) = weak.upgrade() {
+                    app.run_wheel_action(action);
+                    app.wheel.close();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            self.wheel.center.connect_clicked(move |_| {
+                if let Some(app) = weak.upgrade() {
+                    app.wheel.close();
+                    app.canvas.area.grab_focus();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            let position = self.wheel.position.clone();
+            let click = gtk::GestureClick::new();
+            click.connect_pressed(move |_, _, x, y| {
+                let (px, py) = position.get();
+                let inside = x >= px
+                    && x <= px + WHEEL_SIZE as f64
+                    && y >= py
+                    && y <= py + WHEEL_SIZE as f64;
+                if !inside {
+                    if let Some(app) = weak.upgrade() {
+                        app.wheel.close();
+                        app.canvas.area.grab_focus();
+                    }
+                }
+            });
+            self.wheel.root.add_controller(click);
+        }
+    }
+
+    fn open_tool_wheel(self: &Rc<Self>) {
+        let (x, y) = self.canvas.pointer_position();
+        let width = self.canvas.area.width() as f64;
+        let height = self.canvas.area.height() as f64;
+        self.wheel.open(x, y, width, height);
+        self.canvas.area.grab_focus();
+        if crate::canvas::input_debug_enabled() {
+            crate::canvas::input_debug_log(&format!(
+                "[sumi:wheel] open x={x:.1} y={y:.1} area={width:.1}x{height:.1} visible={}",
+                self.wheel.is_open()
+            ));
+        }
+    }
+
+    fn run_wheel_action(self: &Rc<Self>, action: WheelAction) {
+        match action {
+            WheelAction::Tool(tool) => self.activate_tool(tool),
+            WheelAction::Undo => {
+                self.canvas.undo();
+            }
+            WheelAction::Redo => {
+                self.canvas.redo();
+            }
+        }
+        self.canvas.area.grab_focus();
     }
 
     fn wire_shortcuts(self: &Rc<Self>) {
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        // Lenovo Tab Pen Plus reports its single button as Ctrl+1..Ctrl+6
+        // through a virtual keyboard. Use those as an eraser toggle.
+        let pen_button_key: Rc<Cell<Option<gdk::Key>>> = Rc::new(Cell::new(None));
+        let pen_toggle_previous: Rc<Cell<Option<Tool>>> = Rc::new(Cell::new(None));
         {
             let weak = Rc::downgrade(self);
-            keys.connect_key_pressed(move |_, key, _, mods| {
+            let pen_button_key = pen_button_key.clone();
+            let pen_toggle_previous = pen_toggle_previous.clone();
+            keys.connect_key_pressed(move |controller, key, _, mods| {
                 let Some(app) = weak.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
                 if text_focus(&app.window) {
                     return glib::Propagation::Proceed;
                 }
+                if crate::canvas::input_debug_enabled() {
+                    let device = controller
+                        .current_event_device()
+                        .map(|device| device.name().to_string());
+                    crate::canvas::input_debug_log(&format!(
+                        "[sumi:input] key_pressed key={key:?} mods={mods:?} device={device:?}"
+                    ));
+                }
+                let from_stylus = controller
+                    .current_event_device()
+                    .map(|device| crate::canvas::device_looks_like_stylus(&device))
+                    .unwrap_or(false);
+                if from_stylus {
+                    // Bluetooth pens may send their buttons as keyboard keys.
+                    app.canvas.stylus_key_down(key.into_glib());
+                    return glib::Propagation::Stop;
+                }
+                if key == gdk::Key::Escape && app.wheel.is_open() {
+                    app.wheel.close();
+                    app.canvas.area.grab_focus();
+                    return glib::Propagation::Stop;
+                }
+
                 let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
                 let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
+
+                // The tbpen-buttons bridge (and some pen firmwares) sends
+                // Ctrl+1/4/5/6. Keep these semantic instead of toggling here:
+                // 1 = brush, 4 = eraser, 5 = double press (wheel),
+                // 6 = long press (wheel).
+                if ctrl {
+                    match key {
+                        gdk::Key::_1 => {
+                            pen_button_key.set(Some(key));
+                            let restore = pen_toggle_previous.take().unwrap_or(Tool::Pen);
+                            app.activate_tool(restore);
+                            return glib::Propagation::Stop;
+                        }
+                        gdk::Key::_4 => {
+                            pen_button_key.set(Some(key));
+                            let active = app.state.borrow().active_tool;
+                            if active != Tool::Eraser {
+                                pen_toggle_previous.set(Some(active));
+                            }
+                            app.activate_tool(Tool::Eraser);
+                            return glib::Propagation::Stop;
+                        }
+                        gdk::Key::_5 | gdk::Key::_6 => {
+                            // 0x0C0601 (double press) is forwarded as Ctrl+5,
+                            // and long press as Ctrl+6. Both open the wheel.
+                            pen_button_key.set(Some(key));
+                            app.open_tool_wheel();
+                            return glib::Propagation::Stop;
+                        }
+                        _ => {}
+                    }
+                }
 
                 if key == gdk::Key::space && !ctrl {
                     app.canvas.set_space_down(true);
@@ -851,15 +1105,83 @@ impl App {
         }
         {
             let weak = Rc::downgrade(self);
-            keys.connect_key_released(move |_, key, _, _| {
+            let pen_button_key = pen_button_key.clone();
+            keys.connect_key_released(move |controller, key, _, mods| {
+                if crate::canvas::input_debug_enabled() {
+                    let device = controller
+                        .current_event_device()
+                        .map(|device| device.name().to_string());
+                    crate::canvas::input_debug_log(&format!(
+                        "[sumi:input] key_released key={key:?} mods={mods:?} device={device:?}"
+                    ));
+                }
+                let Some(app) = weak.upgrade() else {
+                    return;
+                };
+                if pen_button_key.get() == Some(key) {
+                    pen_button_key.set(None);
+                }
+                let key_code = key.into_glib();
+                let from_stylus = controller
+                    .current_event_device()
+                    .map(|device| crate::canvas::device_looks_like_stylus(&device))
+                    .unwrap_or(false);
+                if from_stylus || app.canvas.stylus_key_held(key_code) {
+                    app.canvas.stylus_key_up(key_code);
+                    return;
+                }
                 if key == gdk::Key::space {
-                    if let Some(app) = weak.upgrade() {
-                        app.canvas.set_space_down(false);
-                    }
+                    app.canvas.set_space_down(false);
                 }
             });
         }
         self.window.add_controller(keys);
+
+        // Some Bluetooth pens report their barrel buttons through a separate
+        // mouse device. Catch those anywhere in the window, not only over the
+        // canvas, and use them as temporary tool modifiers.
+        {
+            let weak = Rc::downgrade(self);
+            let barrel = gtk::EventControllerLegacy::new();
+            barrel.set_propagation_phase(gtk::PropagationPhase::Capture);
+            barrel.connect_event(move |_, event| {
+                if crate::canvas::input_debug_enabled() {
+                    crate::canvas::log_input_event(event);
+                }
+                let kind = event.event_type();
+                if kind != gdk::EventType::ButtonPress
+                    && kind != gdk::EventType::ButtonRelease
+                {
+                    return glib::Propagation::Proceed;
+                }
+                let Some(app) = weak.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                // The AES pen (source Pen or with a device tool) is handled by
+                // the canvas. This path is for separate Bluetooth pen devices.
+                let is_bt_pen = event.device_tool().is_none()
+                    && event
+                        .device()
+                        .map(|device| {
+                            device.source() != gdk::InputSource::Pen
+                                && crate::canvas::device_looks_like_stylus(&device)
+                        })
+                        .unwrap_or(false);
+                if !is_bt_pen {
+                    return glib::Propagation::Proceed;
+                }
+                let Some(button) = event
+                    .downcast_ref::<gdk::ButtonEvent>()
+                    .map(|button| button.button())
+                else {
+                    return glib::Propagation::Proceed;
+                };
+                app.canvas
+                    .stylus_mouse_button(button, kind == gdk::EventType::ButtonPress);
+                glib::Propagation::Stop
+            });
+            self.window.add_controller(barrel);
+        }
     }
 
     fn build_add_menu(self: &Rc<Self>) {
