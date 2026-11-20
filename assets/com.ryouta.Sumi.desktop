@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Sumi
+GenericName=Handwritten Notes
+Comment=Lightweight handwritten notebooks, pages, and PDF annotations
+Exec=sumi %F
+Icon=sumi-app
+Terminal=false
+Categories=Office;Graphics;VectorGraphics;
+MimeType=application/pdf;
+Keywords=note;notebook;handwriting;pdf;canvas;
+StartupNotify=true
+StartupWMClass=sumi
