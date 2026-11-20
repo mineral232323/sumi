@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::f64::consts::{PI, TAU};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use cairo::{Context, FontSlant, FontWeight, Format, ImageSurface, Path};
 use gtk::gdk;
@@ -14,6 +15,65 @@ use crate::model::{
     PAGE_WIDTH,
 };
 use crate::pdf::PdfDoc;
+
+pub(crate) fn input_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("SUMI_DEBUG_INPUT").is_some())
+}
+
+pub(crate) fn device_looks_like_stylus(device: &gdk::Device) -> bool {
+    if device.source() == gdk::InputSource::Pen {
+        return true;
+    }
+    // Some AES / Bluetooth pens are exposed as a generic mouse or keyboard.
+    let name = device.name().to_lowercase();
+    name.contains("pen") || name.contains("stylus") || name.contains("eraser")
+}
+
+pub(crate) fn input_debug_log(message: &str) {
+    eprintln!("{message}");
+    use std::io::Write;
+    let Some(dir) = dirs::data_dir().map(|dir| dir.join("sumi")) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("input-debug.log"))
+    {
+        let _ = writeln!(file, "{message}");
+    }
+}
+
+pub(crate) fn log_input_event(event: &gdk::Event) {
+    if !input_debug_enabled() {
+        return;
+    }
+    let device = event.device();
+    let source = device.as_ref().map(|d| d.source());
+    let name = device.as_ref().map(|d| d.name().to_string());
+    let tool = event.device_tool();
+    let button = event
+        .downcast_ref::<gdk::ButtonEvent>()
+        .map(|e| e.button());
+    input_debug_log(&format!(
+        "[sumi:input] type={:?} source={:?} device={:?} tool={:?} button={:?} mods={:?} pos={:?} pressure={:?} tilt={:?}",
+        event.event_type(),
+        source,
+        name,
+        tool.as_ref()
+            .map(|t| (t.tool_type(), t.axes(), t.serial(), t.hardware_id())),
+        button,
+        event.modifier_state(),
+        event.position(),
+        event.axis(gdk::AxisUse::Pressure),
+        (
+            event.axis(gdk::AxisUse::Xtilt),
+            event.axis(gdk::AxisUse::Ytilt),
+        ),
+    ));
+}
 
 static NEXT_STROKE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -122,6 +182,11 @@ struct State {
     pinching: bool,
     touch_suppressed: bool,
 
+    /// Temporary tool selected by a stylus barrel button or the eraser tip.
+    stylus_tool: Option<Tool>,
+    /// Barrel buttons currently held, in press order (GDK button numbers).
+    stylus_buttons: Vec<u32>,
+
     undo: Vec<Action>,
     redo: Vec<Action>,
 
@@ -161,6 +226,8 @@ impl State {
             space_down: false,
             pinching: false,
             touch_suppressed: false,
+            stylus_tool: None,
+            stylus_buttons: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             cache: None,
@@ -175,9 +242,13 @@ impl State {
         }
     }
 
+    fn active_tool(&self) -> Tool {
+        self.stylus_tool.unwrap_or(self.tool)
+    }
+
     #[allow(dead_code)]
     fn active_size(&self) -> f64 {
-        match self.tool {
+        match self.active_tool() {
             Tool::Pen => self.pen_size,
             Tool::Highlighter => self.highlighter_size,
             Tool::Eraser => self.eraser_size,
@@ -369,9 +440,20 @@ impl Canvas {
                     .axis(gdk::AxisUse::Pressure)
                     .unwrap_or(0.5)
                     .clamp(0.05, 1.0);
+                let eraser_tip = g
+                    .device_tool()
+                    .map(|tool| tool.tool_type() == gdk::DeviceToolType::Eraser)
+                    .unwrap_or(false);
                 if let Some(area) = area_w.upgrade() {
                     area.grab_focus();
                     let mut s = state.borrow_mut();
+                    // A barrel button held before the tip touches down takes
+                    // precedence, then the eraser end of the pen.
+                    if eraser_tip {
+                        s.stylus_tool = Some(Tool::Eraser);
+                    } else if s.stylus_tool.is_none() {
+                        s.stylus_tool = stylus_tool_for_event_state(g.current_event_state());
+                    }
                     s.cursor = Some((x, y));
                     pointer_down(&mut s, x, y, pressure);
                     drop(s);
@@ -408,7 +490,11 @@ impl Canvas {
                 if let Some(area) = area_w.upgrade() {
                     let changed = {
                         let mut s = state.borrow_mut();
-                        pointer_up(&mut s, x, y, pressure)
+                        let changed = pointer_up(&mut s, x, y, pressure);
+                        // The eraser tip override ends with the contact. If a
+                        // barrel button is still held, keep its temporary tool.
+                        s.stylus_tool = stylus_tool_for_buttons(&s.stylus_buttons);
+                        changed
                     };
                     area.queue_draw();
                     if changed {
@@ -419,6 +505,110 @@ impl Canvas {
             }
         });
         area.add_controller(stylus);
+
+        // Barrel buttons on the stylus. GTK only routes the tip through
+        // GestureStylus, so track the extra buttons ourselves.
+        let barrel = gtk::EventControllerLegacy::new();
+        barrel.set_propagation_phase(gtk::PropagationPhase::Capture);
+        barrel.connect_event({
+            let state = state.clone();
+            let area_w = area.downgrade();
+            move |_, event| {
+                log_input_event(event);
+                // Some pens (including AES/Bluetooth pens) are exposed as a
+                // generic mouse rather than GDK_SOURCE_PEN. Any event that
+                // carries a device tool, or a device that looks like a pen,
+                // is still treated as a stylus.
+                let is_stylus = event.device_tool().is_some()
+                    || event
+                        .device()
+                        .map(|device| device_looks_like_stylus(&device))
+                        .unwrap_or(false);
+                if !is_stylus {
+                    return glib::Propagation::Proceed;
+                }
+
+                match event.event_type() {
+                    gdk::EventType::ButtonPress => {
+                        let button = event
+                            .downcast_ref::<gdk::ButtonEvent>()
+                            .map(|button_event| button_event.button())
+                            .unwrap_or(0);
+                        // Button 1 is the tip (handled by GestureStylus).
+                        // Stylus barrel buttons use backend-dependent numbers,
+                        // so treat any other pen button as a barrel button.
+                        if button <= 1 {
+                            return glib::Propagation::Proceed;
+                        }
+                        let Some((x, y)) = event.position() else {
+                            return glib::Propagation::Stop;
+                        };
+                        let pressure = event
+                            .axis(gdk::AxisUse::Pressure)
+                            .unwrap_or(0.5)
+                            .clamp(0.05, 1.0);
+                        let mut committed = false;
+                        if let Some(area) = area_w.upgrade() {
+                            {
+                                let mut s = state.borrow_mut();
+                                if !s.stylus_buttons.contains(&button) {
+                                    s.stylus_buttons.push(button);
+                                }
+                                let was_eraser = s.stylus_tool == Some(Tool::Eraser);
+                                s.stylus_tool =
+                                    stylus_tool_for_buttons(&s.stylus_buttons);
+                                s.cursor = Some((x, y));
+                                // Pressing the eraser button in the middle of a
+                                // stroke switches straight to erasing.
+                                if !was_eraser
+                                    && s.stylus_tool == Some(Tool::Eraser)
+                                    && matches!(&s.interaction, Interaction::Stroke { .. })
+                                {
+                                    committed = pointer_up(&mut s, x, y, pressure);
+                                    pointer_down(&mut s, x, y, pressure);
+                                }
+                            }
+                            area.queue_draw();
+                            if committed {
+                                notify_changed(&state);
+                                emit_view(&state);
+                            }
+                        }
+                        glib::Propagation::Stop
+                    }
+                    gdk::EventType::ButtonRelease => {
+                        let button = event
+                            .downcast_ref::<gdk::ButtonEvent>()
+                            .map(|button_event| button_event.button())
+                            .unwrap_or(0);
+                        if button <= 1 {
+                            return glib::Propagation::Proceed;
+                        }
+                        if let Some(area) = area_w.upgrade() {
+                            let mut s = state.borrow_mut();
+                            s.stylus_buttons.retain(|held| *held != button);
+                            // Keep the current tool while a stroke is still in
+                            // progress; the stylus-up handler clears it.
+                            if matches!(&s.interaction, Interaction::None) {
+                                s.stylus_tool =
+                                    stylus_tool_for_buttons(&s.stylus_buttons);
+                            }
+                            drop(s);
+                            area.queue_draw();
+                        }
+                        glib::Propagation::Stop
+                    }
+                    gdk::EventType::ProximityOut => {
+                        let mut s = state.borrow_mut();
+                        s.stylus_buttons.clear();
+                        s.stylus_tool = None;
+                        glib::Propagation::Proceed
+                    }
+                    _ => glib::Propagation::Proceed,
+                }
+            }
+        });
+        area.add_controller(barrel);
 
         // Primary drag: mouse drawing / touch panning.
         let drag = gtk::GestureDrag::new();
@@ -512,7 +702,18 @@ impl Canvas {
         middle.connect_drag_begin({
             let state = state.clone();
             let area_w = area.downgrade();
-            move |_g, x, y| {
+            move |g, x, y| {
+                // A stylus barrel button also reports as a middle click.
+                let is_pen = g
+                    .current_event_device()
+                    .map(|device| device_looks_like_stylus(&device))
+                    .unwrap_or(false);
+                if is_pen {
+                    // Denying may synchronously emit drag-end, so do not
+                    // borrow the canvas state yet.
+                    g.set_state(gtk::EventSequenceState::Denied);
+                    return;
+                }
                 if let Some(area) = area_w.upgrade() {
                     let mut s = state.borrow_mut();
                     if matches!(&s.interaction, Interaction::None | Interaction::Pan { .. }) {
@@ -713,6 +914,8 @@ impl Canvas {
             s.cursor = None;
             s.pinching = false;
             s.touch_suppressed = false;
+            s.stylus_tool = None;
+            s.stylus_buttons.clear();
             s.path_cache.clear();
             s.pdf_pages.clear();
             s.pdf_scale = 0.0;
@@ -846,6 +1049,42 @@ impl Canvas {
         self.state.borrow_mut().space_down = down;
     }
 
+    /// Handle a button that a Bluetooth pen reports as a keyboard key.
+    pub fn stylus_key_down(&self, key: u32) {
+        self.stylus_aux_button(synthetic_button(key), true);
+    }
+
+    pub fn stylus_key_up(&self, key: u32) {
+        self.stylus_aux_button(synthetic_button(key), false);
+    }
+
+    pub fn stylus_key_held(&self, key: u32) -> bool {
+        self.state
+            .borrow()
+            .stylus_buttons
+            .contains(&synthetic_button(key))
+    }
+
+    /// Handle a barrel button reported by a separate Bluetooth pen device.
+    pub fn stylus_mouse_button(&self, button: u32, pressed: bool) {
+        self.stylus_aux_button(button, pressed);
+    }
+
+    fn stylus_aux_button(&self, button: u32, pressed: bool) {
+        {
+            let mut s = self.state.borrow_mut();
+            if pressed {
+                if !s.stylus_buttons.contains(&button) {
+                    s.stylus_buttons.push(button);
+                }
+            } else {
+                s.stylus_buttons.retain(|held| *held != button);
+            }
+            s.stylus_tool = stylus_tool_for_buttons(&s.stylus_buttons);
+        }
+        self.area.queue_draw();
+    }
+
     pub fn zoom_in(&self) {
         let (sx, sy) = self.view_center();
         {
@@ -905,6 +1144,13 @@ impl Canvas {
 
     pub fn view_info(&self) -> ViewInfo {
         self.state.borrow().view_info()
+    }
+
+    /// Last pointer position in canvas coordinates (or the view center).
+    pub fn pointer_position(&self) -> (f64, f64) {
+        let s = self.state.borrow();
+        s.cursor
+            .unwrap_or((s.width as f64 / 2.0, s.height as f64 / 2.0))
     }
 
     fn view_center(&self) -> (f64, f64) {
@@ -992,11 +1238,41 @@ fn emit_view(state: &Rc<RefCell<State>>) {
     }
 }
 
+/// Maps currently held stylus barrel buttons to a temporary tool.
+/// GDK reports the main barrel button as middle (2) and the second one as
+/// secondary (3); a third button is reported as 8. Unknown buttons erase.
+fn synthetic_button(key: u32) -> u32 {
+    0x8000_0000 | key
+}
+
+fn stylus_tool_for_buttons(buttons: &[u32]) -> Option<Tool> {
+    if buttons.contains(&2) {
+        Some(Tool::Eraser)
+    } else if buttons.contains(&3) || buttons.contains(&8) || buttons.len() >= 2 {
+        Some(Tool::Hand)
+    } else if !buttons.is_empty() {
+        Some(Tool::Eraser)
+    } else {
+        None
+    }
+}
+
+fn stylus_tool_for_event_state(state: gdk::ModifierType) -> Option<Tool> {
+    if state.contains(gdk::ModifierType::BUTTON2_MASK) {
+        Some(Tool::Eraser)
+    } else if state.contains(gdk::ModifierType::BUTTON3_MASK) {
+        Some(Tool::Hand)
+    } else {
+        None
+    }
+}
+
 fn pointer_down(s: &mut State, x: f64, y: f64, pressure: f64) {
     if s.note.is_none() || !matches!(&s.interaction, Interaction::None) {
         return;
     }
-    if s.space_down || s.tool == Tool::Hand {
+    let tool = s.active_tool();
+    if s.space_down || tool == Tool::Hand {
         s.interaction = Interaction::Pan {
             start: (x, y),
             camera: s.camera,
@@ -1011,9 +1287,9 @@ fn pointer_down(s: &mut State, x: f64, y: f64, pressure: f64) {
         return;
     };
     let (cx, cy) = note.clamp_to_page(&s.layout, page, wx, wy);
-    match s.tool {
+    match tool {
         Tool::Pen | Tool::Highlighter => {
-            let tool = if s.tool == Tool::Pen {
+            let tool = if tool == Tool::Pen {
                 StrokeTool::Pen
             } else {
                 StrokeTool::Highlighter
@@ -1586,11 +1862,12 @@ impl State {
 
         // Cursor.
         if let Some((x, y)) = self.cursor {
-            let hand = self.space_down || self.tool == Tool::Hand;
+            let tool = self.active_tool();
+            let hand = self.space_down || tool == Tool::Hand;
             let radius = if hand {
                 7.0
             } else {
-                match self.tool {
+                match tool {
                     Tool::Pen => (self.pen_size * zoom * 0.5).max(2.0),
                     Tool::Highlighter => (self.highlighter_size * zoom * 0.5).max(4.0),
                     Tool::Eraser => self.eraser_size * 0.5,

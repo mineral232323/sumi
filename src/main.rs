@@ -11,13 +11,21 @@ use gtk::prelude::*;
 use libadwaita as adw;
 
 fn main() -> glib::ExitCode {
-    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+    let mut args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
         println!(
             "sumi {} ({})",
             env!("CARGO_PKG_VERSION"),
             env!("SUMI_GIT_HASH")
         );
         return glib::ExitCode::SUCCESS;
+    }
+
+    if args.iter().any(|arg| arg == "--input-debug") {
+        std::env::set_var("SUMI_DEBUG_INPUT", "1");
+        // GApplication rejects options it does not know, so remove ours
+        // before handing the command line over.
+        args.retain(|arg| arg != "--input-debug");
     }
 
     glib::set_application_name("Sumi");
@@ -34,7 +42,7 @@ fn main() -> glib::ExitCode {
         app::build(app);
     });
 
-    application.run()
+    application.run_with_args(&args)
 }
 
 fn load_css() {
