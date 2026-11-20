@@ -1642,6 +1642,7 @@ fn select_click(s: &mut State, x: f64, y: f64, additive: bool) {
         s.selection.clear();
         s.selection_page = None;
     }
+    let bounds = selection_bounds(note, page, &s.selection);
     if let Some(id) =
         stroke_at(note, page, wx, wy, s.camera.zoom).map(|index| note.pages[page].strokes[index].id)
     {
@@ -1651,7 +1652,7 @@ fn select_click(s: &mut State, x: f64, y: f64, additive: bool) {
             } else {
                 s.selection.push(id);
             }
-        } else {
+        } else if !s.selection.contains(&id) {
             s.selection = vec![id];
         }
         s.selection_page = if s.selection.is_empty() {
@@ -1659,9 +1660,14 @@ fn select_click(s: &mut State, x: f64, y: f64, additive: bool) {
         } else {
             Some(page)
         };
-    } else if !additive {
-        s.selection.clear();
-        s.selection_page = None;
+    } else {
+        let inside = bounds
+            .map(|bounds| expanded_contains(bounds, wx, wy, 6.0 / s.camera.zoom))
+            .unwrap_or(false);
+        if !additive && !inside {
+            s.selection.clear();
+            s.selection_page = None;
+        }
     }
 }
 
@@ -1725,6 +1731,7 @@ fn pointer_down(s: &mut State, x: f64, y: f64, pressure: f64, additive: bool) {
                 s.selection.clear();
                 s.selection_page = None;
             }
+            let bounds = selection_bounds(note, page, &s.selection);
             let hit = stroke_at(note, page, wx, wy, s.camera.zoom)
                 .map(|index| note.pages[page].strokes[index].id);
             if let Some(id) = hit {
@@ -1759,15 +1766,38 @@ fn pointer_down(s: &mut State, x: f64, y: f64, pressure: f64, additive: bool) {
                     originals,
                 };
             } else {
-                if !additive {
-                    s.clear_selection();
+                let inside_selection = !additive
+                    && bounds
+                        .map(|bounds| expanded_contains(bounds, wx, wy, 6.0 / s.camera.zoom))
+                        .unwrap_or(false);
+                if inside_selection {
+                    let ids = s.selection.clone();
+                    let originals: Vec<(usize, Stroke)> = note.pages[page]
+                        .strokes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, stroke)| ids.contains(&stroke.id))
+                        .map(|(index, stroke)| (index, stroke.clone()))
+                        .collect();
+                    s.interaction = Interaction::MoveSelection {
+                        page,
+                        start: (wx, wy),
+                        delta: (0.0, 0.0),
+                        moved: false,
+                        ids,
+                        originals,
+                    };
+                } else {
+                    if !additive {
+                        s.clear_selection();
+                    }
+                    s.interaction = Interaction::Select {
+                        page,
+                        start: (wx, wy),
+                        current: (wx, wy),
+                        additive,
+                    };
                 }
-                s.interaction = Interaction::Select {
-                    page,
-                    start: (wx, wy),
-                    current: (wx, wy),
-                    additive,
-                };
             }
         }
         Tool::Hand => {}
@@ -2159,6 +2189,23 @@ fn union_rect(a: Rect, b: Rect) -> Rect {
 
 fn clipboard_bounds(strokes: &[Stroke]) -> Option<Rect> {
     strokes.iter().filter_map(stroke_bounds).reduce(union_rect)
+}
+
+fn selection_bounds(note: &Note, page: usize, ids: &[u64]) -> Option<Rect> {
+    note.pages
+        .get(page)?
+        .strokes
+        .iter()
+        .filter(|stroke| ids.contains(&stroke.id))
+        .filter_map(stroke_bounds)
+        .reduce(union_rect)
+}
+
+fn expanded_contains(bounds: Rect, x: f64, y: f64, pad: f64) -> bool {
+    x >= bounds.x - pad
+        && x <= bounds.x + bounds.w + pad
+        && y >= bounds.y - pad
+        && y <= bounds.y + bounds.h + pad
 }
 
 fn clamp_translation(bounds: Rect, target: Rect, dx: f64, dy: f64) -> (f64, f64) {
@@ -2903,6 +2950,47 @@ mod tests {
         let stroke = &state.note.as_ref().unwrap().pages[0].strokes[0];
         assert!((stroke.points[0].x - 10.0).abs() < 1e-9);
         assert!((stroke.points[0].y - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn clicking_a_selected_stroke_keeps_the_group() {
+        let mut state = state_with_stroke();
+        state.selection = vec![1, 2];
+        state.selection_page = Some(0);
+        select_click(&mut state, 15.0, 15.0, false);
+        assert_eq!(state.selection, vec![1, 2]);
+    }
+
+    #[test]
+    fn dragging_inside_selection_bounds_moves_the_whole_group() {
+        let mut state = state_with_stroke();
+        state.note.as_mut().unwrap().pages[0].strokes.push(Stroke {
+            id: 2,
+            tool: StrokeTool::Pen,
+            color: "#000000".into(),
+            width: 4.0,
+            points: vec![
+                Point {
+                    x: 50.0,
+                    y: 50.0,
+                    p: 0.5,
+                },
+                Point {
+                    x: 60.0,
+                    y: 60.0,
+                    p: 0.5,
+                },
+            ],
+        });
+        state.selection = vec![1, 2];
+        state.selection_page = Some(0);
+        // Empty space between the two strokes, but inside the group bounds.
+        pointer_down(&mut state, 40.0, 40.0, 0.5, false);
+        pointer_move(&mut state, 50.0, 50.0, 0.5);
+        assert!(pointer_up(&mut state, 50.0, 50.0, 0.5));
+        let strokes = &state.note.as_ref().unwrap().pages[0].strokes;
+        assert!((strokes[0].points[0].x - 20.0).abs() < 1e-9);
+        assert!((strokes[1].points[0].x - 60.0).abs() < 1e-9);
     }
 
     #[test]
