@@ -203,6 +203,7 @@ struct AppState {
     active_id: Option<String>,
     active_kind: Option<NoteKind>,
     active_tool: Tool,
+    last_non_eraser: Tool,
     pen_color: String,
     highlight_color: String,
     pen_size: f64,
@@ -224,6 +225,7 @@ impl AppState {
             active_id: None,
             active_kind: None,
             active_tool: Tool::Pen,
+            last_non_eraser: Tool::Pen,
             pen_color: PEN_COLORS[0].1.to_string(),
             highlight_color: HIGHLIGHT_COLORS[0].1.to_string(),
             pen_size: 3.2,
@@ -1003,11 +1005,11 @@ impl App {
         // Lenovo Tab Pen Plus reports its single button as Ctrl+1..Ctrl+6
         // through a virtual keyboard. Use those as an eraser toggle.
         let pen_button_key: Rc<Cell<Option<gdk::Key>>> = Rc::new(Cell::new(None));
-        let pen_toggle_previous: Rc<Cell<Option<Tool>>> = Rc::new(Cell::new(None));
+        let pen_button_last: Rc<Cell<Option<std::time::Instant>>> = Rc::new(Cell::new(None));
         {
             let weak = Rc::downgrade(self);
             let pen_button_key = pen_button_key.clone();
-            let pen_toggle_previous = pen_toggle_previous.clone();
+            let pen_button_last = pen_button_last.clone();
             keys.connect_key_pressed(move |controller, key, _, mods| {
                 let Some(app) = weak.upgrade() else {
                     return glib::Propagation::Proceed;
@@ -1045,24 +1047,37 @@ impl App {
                 let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
 
                 // The tbpen-buttons bridge (and some pen firmwares) sends
-                // Ctrl+1/4/5/6. Keep these semantic instead of toggling here:
-                // 1 = brush, 4 = eraser, 5 = double press (wheel),
-                // 6 = long press (wheel).
+                // Ctrl+1/4/5/6. 1/4 are one short press (the bridge may send
+                // both, or alternate), 5 = double press, 6 = long press.
                 if ctrl {
                     match key {
-                        gdk::Key::_1 => {
+                        gdk::Key::_1 | gdk::Key::_4 => {
                             pen_button_key.set(Some(key));
-                            let restore = pen_toggle_previous.take().unwrap_or(Tool::Pen);
-                            app.activate_tool(restore);
-                            return glib::Propagation::Stop;
-                        }
-                        gdk::Key::_4 => {
-                            pen_button_key.set(Some(key));
-                            let active = app.state.borrow().active_tool;
-                            if active != Tool::Eraser {
-                                pen_toggle_previous.set(Some(active));
+                            // A single physical press can produce more than one
+                            // synthetic key. Collapse that burst into one toggle.
+                            if let Some(last) = pen_button_last.get() {
+                                if last.elapsed() < Duration::from_millis(500) {
+                                    if crate::canvas::input_debug_enabled() {
+                                        crate::canvas::input_debug_log(
+                                            "[sumi:pen] duplicate key ignored",
+                                        );
+                                    }
+                                    return glib::Propagation::Stop;
+                                }
                             }
-                            app.activate_tool(Tool::Eraser);
+                            pen_button_last.set(Some(std::time::Instant::now()));
+                            let active = app.state.borrow().active_tool;
+                            let restore = app.state.borrow().last_non_eraser;
+                            if crate::canvas::input_debug_enabled() {
+                                crate::canvas::input_debug_log(&format!(
+                                    "[sumi:pen] key={key:?} active={active:?} restore={restore:?}"
+                                ));
+                            }
+                            if active == Tool::Eraser {
+                                app.activate_tool(restore);
+                            } else {
+                                app.activate_tool(Tool::Eraser);
+                            }
                             return glib::Propagation::Stop;
                         }
                         gdk::Key::_5 | gdk::Key::_6 => {
@@ -1692,6 +1707,9 @@ impl App {
         {
             let mut st = self.state.borrow_mut();
             st.active_tool = tool;
+            if tool != Tool::Eraser {
+                st.last_non_eraser = tool;
+            }
         }
         self.canvas.set_tool(tool);
         let color = {
