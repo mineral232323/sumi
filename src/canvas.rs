@@ -436,15 +436,10 @@ impl Canvas {
                     let mut s = state.borrow_mut();
                     match source {
                         Some(gdk::InputSource::Touchscreen) => {
-                            if s.pinching || s.touch_suppressed {
-                                return;
-                            }
-                            if matches!(&s.interaction, Interaction::None) {
-                                s.interaction = Interaction::Pan {
-                                    start: (x, y),
-                                    camera: s.camera,
-                                };
-                            }
+                            // Let GestureZoom own touch sequences. If the drag
+                            // gesture claims one finger first, two-finger pinch
+                            // recognition becomes unreliable.
+                            g.set_state(gtk::EventSequenceState::Denied);
                         }
                         Some(gdk::InputSource::Pen) | Some(gdk::InputSource::TabletPad) => {
                             // The stylus gesture handles these when available.
