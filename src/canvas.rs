@@ -1554,7 +1554,7 @@ impl State {
             match item {
                 LiveItem::Stroke(stroke) => {
                     self.scratch_ctx.new_path();
-                    build_stroke_path(&self.scratch_ctx, &stroke);
+                    build_live_stroke_path(&self.scratch_ctx, &stroke);
                     if let Ok(path) = self.scratch_ctx.copy_path() {
                         paint_stroke(ctx, &stroke, &path, 1.0);
                     }
@@ -1637,6 +1637,24 @@ fn rounded_rect(ctx: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
     ctx.arc(x + r, y + h - r, r, PI * 0.5, PI);
     ctx.arc(x + r, y + r, r, PI, PI * 1.5);
     ctx.close_path();
+}
+
+/// Cheap path for the in-progress stroke: one cubic per input point instead of
+/// resampling the whole line at sub-pixel intervals on every motion event.
+/// The committed stroke is rebuilt at full quality when the pen is lifted.
+fn build_live_stroke_path(ctx: &Context, stroke: &Stroke) {
+    let points = smooth_points(&stroke.points);
+    if points.is_empty() {
+        return;
+    }
+    if points.len() == 1 {
+        let (x, y) = (points[0].x, points[0].y);
+        ctx.move_to(x, y);
+        ctx.line_to(x + 0.01, y);
+        return;
+    }
+    let xy: Vec<(f64, f64)> = points.iter().map(|p| (p.x, p.y)).collect();
+    append_smooth_polyline(ctx, &xy);
 }
 
 fn build_stroke_path(ctx: &Context, stroke: &Stroke) {
