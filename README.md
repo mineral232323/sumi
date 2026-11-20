@@ -50,6 +50,14 @@ cargo build --release
 
 クロスコンパイルする場合は aarch64 用の sysroot が必要です（例: `cross` + `aarch64-unknown-linux-gnu` 用の GTK/Poppler 開発パッケージ）。手元の x86_64 バイナリはそのまま ARM では動きません。
 
+## 更新
+
+```sh
+./build.sh
+```
+
+`git pull`、リリースビルド、バージョン確認、`install.sh` をまとめて実行します。
+
 ## インストール
 
 ```sh
