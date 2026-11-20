@@ -11,6 +11,15 @@ use gtk::prelude::*;
 use libadwaita as adw;
 
 fn main() -> glib::ExitCode {
+    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+        println!(
+            "sumi {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            env!("SUMI_GIT_HASH")
+        );
+        return glib::ExitCode::SUCCESS;
+    }
+
     glib::set_application_name("Sumi");
     let application = adw::Application::builder()
         .application_id("com.ryouta.Sumi")

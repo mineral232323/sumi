@@ -31,6 +31,13 @@ cargo build --release
 ./target/release/sumi
 ```
 
+バージョンとビルド元のコミットを確認する場合:
+
+```sh
+./target/release/sumi --version
+# sumi 0.1.0 (84e1cf9)
+```
+
 ### Linux ARM (aarch64)
 
 GTK / Poppler をシステムライブラリとしてリンクするため、aarch64 マシン上でネイティブにビルドするのが簡単です。
