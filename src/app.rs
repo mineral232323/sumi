@@ -289,7 +289,7 @@ pub fn build(application: &adw::Application) {
         .width_request(640)
         .height_request(460)
         .build();
-    window.set_icon_name(Some("sumi-app"));
+    window.set_icon_name(Some(crate::APP_ID));
 
     let canvas = Canvas::new();
     canvas.area.set_hexpand(true);
@@ -1354,7 +1354,7 @@ impl App {
 
     fn build_empty_page(self: &Rc<Self>) {
         let page = adw::StatusPage::new();
-        page.set_icon_name(Some("sumi-app"));
+        page.set_icon_name(Some(crate::APP_ID));
         page.set_title("何を書きますか？");
         page.set_description(Some(
             "手書きのための、軽いノート。データはこの端末にだけ保存されます。",

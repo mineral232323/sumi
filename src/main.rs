@@ -10,6 +10,8 @@ use gtk::glib;
 use gtk::prelude::*;
 use libadwaita as adw;
 
+pub const APP_ID: &str = "com.ryouta.Sumi";
+
 fn main() -> glib::ExitCode {
     let mut args: Vec<String> = std::env::args().collect();
     if args.iter().any(|arg| arg == "--version" || arg == "-V") {
@@ -30,13 +32,13 @@ fn main() -> glib::ExitCode {
 
     glib::set_application_name("Sumi");
     let application = adw::Application::builder()
-        .application_id("com.ryouta.Sumi")
+        .application_id(APP_ID)
         .build();
 
     application.connect_startup(|_| {
         icons::install();
         load_css();
-        gtk::Window::set_default_icon_name("sumi-app");
+        gtk::Window::set_default_icon_name(APP_ID);
     });
     application.connect_activate(|app| {
         app::build(app);

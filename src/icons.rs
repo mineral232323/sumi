@@ -38,7 +38,7 @@ const ACTIONS: &[(&str, &str)] = &[
     ),
 ];
 
-const APP_ICON: &str = include_str!("../assets/icons/apps/sumi-app.svg");
+const APP_ICON: &str = include_str!("../assets/icons/apps/com.ryouta.Sumi.svg");
 
 pub fn install() {
     let Some(display) = gdk::Display::default() else {
@@ -52,9 +52,9 @@ pub fn install() {
     for (name, data) in ACTIONS {
         let _ = fs::write(actions.join(name), data);
     }
-    let _ = fs::write(apps.join("sumi-app.svg"), APP_ICON);
+    let _ = fs::write(apps.join(format!("{}.svg", crate::APP_ID)), APP_ICON);
 
     let theme = gtk::IconTheme::for_display(&display);
     theme.add_search_path(&root);
-    gtk::Window::set_default_icon_name("sumi-app");
+    gtk::Window::set_default_icon_name(crate::APP_ID);
 }

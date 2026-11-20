@@ -15,7 +15,9 @@ fi
 install -d "$BIN_DIR" "$APP_DIR" "$ICON_DIR"
 install -m 755 target/release/sumi "$BIN_DIR/sumi"
 install -m 644 assets/com.ryouta.Sumi.desktop "$APP_DIR/com.ryouta.Sumi.desktop"
-install -m 644 assets/icons/apps/sumi-app.svg "$ICON_DIR/sumi-app.svg"
+install -m 644 assets/icons/apps/com.ryouta.Sumi.svg "$ICON_DIR/com.ryouta.Sumi.svg"
+# Remove the old icon name used by earlier releases.
+rm -f "$ICON_DIR/sumi-app.svg"
 
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache -q "${HOME}/.local/share/icons/hicolor" 2>/dev/null || true
