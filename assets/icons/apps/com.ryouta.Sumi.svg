@@ -1,12 +1,27 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#2b2f38"/>
-      <stop offset="1" stop-color="#15171b"/>
+    <linearGradient id="paper" x1="0" y1="0" x2="0.7" y2="1">
+      <stop offset="0" stop-color="#fbf7ee"/>
+      <stop offset="0.55" stop-color="#f1e7d3"/>
+      <stop offset="1" stop-color="#e2d2b3"/>
     </linearGradient>
+    <linearGradient id="ink" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#323239"/>
+      <stop offset="1" stop-color="#0c0c10"/>
+    </linearGradient>
+    <linearGradient id="seal" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d65b42"/>
+      <stop offset="1" stop-color="#b33a27"/>
+    </linearGradient>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="2" stdDeviation="1.6" flood-color="#6b5330" flood-opacity="0.2"/>
+    </filter>
   </defs>
-  <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#bg)"/>
-  <path d="M38 88c10-2 20-8 29-18 10-11 17-23 23-34" fill="none" stroke="#f6f1e6" stroke-width="10" stroke-linecap="round"/>
-  <path d="M41 92c8-2 15-6 23-13" fill="none" stroke="#e8b25a" stroke-width="6" stroke-linecap="round" opacity=".9"/>
-  <circle cx="88" cy="40" r="5" fill="#e8b25a"/>
+  <rect x="6" y="6" width="116" height="116" rx="30" fill="url(#paper)"/>
+  <rect x="6.75" y="6.75" width="114.5" height="114.5" rx="29.25" fill="none" stroke="#7a6647" stroke-opacity="0.22"/>
+  <path d="M 88 28 C 65 30 44 39 39 54 C 34 68 50 77 66 82 C 82 88 87 96 79 102 C 70 108 55 106 44 100"
+        fill="none" stroke="url(#ink)" stroke-width="13" stroke-linecap="round" stroke-linejoin="round" filter="url(#soft)"/>
+  <path d="M 87 34 C 69 34 53 41 47 51" fill="none" stroke="#f7f1e4" stroke-width="2.2" stroke-linecap="round" opacity="0.22"/>
+  <rect x="79" y="81" width="19" height="19" rx="5" fill="url(#seal)"/>
+  <circle cx="88.5" cy="90.5" r="3.6" fill="#f4e7d1" opacity="0.92"/>
 </svg>
