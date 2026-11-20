@@ -433,14 +433,15 @@ impl Canvas {
                 let source = g.current_event_device().map(|d| d.source());
                 if let Some(area) = area_w.upgrade() {
                     area.grab_focus();
+                    if source == Some(gdk::InputSource::Touchscreen) {
+                        // Let GestureZoom own touch sequences. Denying the drag
+                        // here may synchronously emit drag-end, so the canvas
+                        // state must not be borrowed yet.
+                        g.set_state(gtk::EventSequenceState::Denied);
+                        return;
+                    }
                     let mut s = state.borrow_mut();
                     match source {
-                        Some(gdk::InputSource::Touchscreen) => {
-                            // Let GestureZoom own touch sequences. If the drag
-                            // gesture claims one finger first, two-finger pinch
-                            // recognition becomes unreliable.
-                            g.set_state(gtk::EventSequenceState::Denied);
-                        }
                         Some(gdk::InputSource::Pen) | Some(gdk::InputSource::TabletPad) => {
                             // The stylus gesture handles these when available.
                         }
