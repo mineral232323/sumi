@@ -56,7 +56,7 @@ pub enum StrokeTool {
     Highlighter,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct Point {
     pub x: f64,
     pub y: f64,
@@ -68,7 +68,7 @@ fn half_pressure() -> f64 {
     0.5
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Stroke {
     #[serde(default)]
     pub id: u64,
@@ -78,7 +78,7 @@ pub struct Stroke {
     pub points: Vec<Point>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Page {
     #[serde(default)]
     pub strokes: Vec<Stroke>,

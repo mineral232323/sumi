@@ -13,9 +13,11 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::canvas::{Canvas, Tool, ViewInfo};
-use crate::model::{now_secs, Note, NoteKind, NoteMeta};
+use crate::model::{now_secs, Note, NoteKind, NoteMeta, Page};
 use crate::pdf::{self, PdfDoc};
 use crate::store::Store;
+
+const AUTOSAVE_SECONDS: u32 = 60;
 
 const PEN_COLORS: [(&str, &str); 6] = [
     ("ink", "#23262b"),
@@ -210,7 +212,7 @@ struct AppState {
     highlighter_size: f64,
     eraser_size: f64,
     pending: HashMap<String, Note>,
-    save_source: Option<glib::SourceId>,
+    saved_pages: HashMap<String, Vec<Page>>,
     rebuilding: bool,
     adjusting: bool,
     syncing_toggle: bool,
@@ -232,7 +234,7 @@ impl AppState {
             highlighter_size: 20.0,
             eraser_size: 26.0,
             pending: HashMap::new(),
-            save_source: None,
+            saved_pages: HashMap::new(),
             rebuilding: false,
             adjusting: false,
             syncing_toggle: false,
@@ -257,6 +259,7 @@ struct App {
     sidebar_toggle: gtk::ToggleButton,
     undo_btn: gtk::Button,
     redo_btn: gtk::Button,
+    save_btn: gtk::Button,
     wheel: ToolWheel,
     content_menu: gtk::MenuButton,
     add_menu: gtk::MenuButton,
@@ -359,6 +362,12 @@ pub fn build(application: &adw::Application) {
     redo_btn.set_sensitive(false);
     content_header.pack_start(&redo_btn);
 
+    let save_btn = gtk::Button::from_icon_name("document-save-symbolic");
+    save_btn.set_tooltip_text(Some("保存 (Ctrl+S) · 60秒ごとに自動保存"));
+    save_btn.add_css_class("flat");
+    save_btn.set_sensitive(false);
+    content_header.pack_start(&save_btn);
+
     content_header.set_title_widget(Some(&window_title));
 
     let content_menu = gtk::MenuButton::new();
@@ -450,6 +459,7 @@ pub fn build(application: &adw::Application) {
         sidebar_toggle,
         undo_btn,
         redo_btn,
+        save_btn,
         wheel,
         content_menu,
         add_menu,
@@ -666,7 +676,7 @@ impl App {
                         if let Some(note) = app.canvas.note() {
                             app.update_row(&note);
                             app.update_header(&note);
-                            app.schedule_save(note);
+                            app.queue_save(note);
                         }
                     }
                 },
@@ -752,6 +762,15 @@ impl App {
             self.redo_btn.connect_clicked(move |_| {
                 if let Some(app) = weak.upgrade() {
                     app.canvas.redo();
+                    app.canvas.area.grab_focus();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            self.save_btn.connect_clicked(move |_| {
+                if let Some(app) = weak.upgrade() {
+                    app.save_now();
                     app.canvas.area.grab_focus();
                 }
             });
@@ -912,6 +931,18 @@ impl App {
                     app.flush_saves();
                 }
                 glib::Propagation::Proceed
+            });
+        }
+
+        // Autosave once a minute. Changes remain in memory until then;
+        // manual save, note switching, and window close flush immediately.
+        {
+            let weak = Rc::downgrade(self);
+            glib::timeout_add_seconds_local(AUTOSAVE_SECONDS, move || {
+                if let Some(app) = weak.upgrade() {
+                    app.flush_saves();
+                }
+                glib::ControlFlow::Continue
             });
         }
 
@@ -1093,6 +1124,10 @@ impl App {
 
                 if key == gdk::Key::space && !ctrl {
                     app.canvas.set_space_down(true);
+                    return glib::Propagation::Stop;
+                }
+                if ctrl && (key == gdk::Key::s || key == gdk::Key::S) {
+                    app.save_now();
                     return glib::Propagation::Stop;
                 }
                 if ctrl && (key == gdk::Key::c || key == gdk::Key::C) {
@@ -1301,6 +1336,22 @@ impl App {
         body.add_css_class("sumi-menu");
         body.set_width_request(200);
 
+        let save = menu_button("document-save-symbolic", "保存", "Ctrl+S");
+        {
+            let weak = Rc::downgrade(self);
+            let pop = popover.downgrade();
+            save.connect_clicked(move |_| {
+                if let Some(pop) = pop.upgrade() {
+                    pop.popdown();
+                }
+                if let Some(app) = weak.upgrade() {
+                    app.save_now();
+                    app.canvas.area.grab_focus();
+                }
+            });
+        }
+        body.append(&save);
+
         let rename = menu_button("document-edit-symbolic", "名前を変更", "");
         {
             let weak = Rc::downgrade(self);
@@ -1495,6 +1546,12 @@ impl App {
             st.active_kind = Some(note.kind);
         }
         self.canvas.set_note(Some(note.clone()), pdf);
+        if let Some(current) = self.canvas.note() {
+            self.state
+                .borrow_mut()
+                .saved_pages
+                .insert(current.id.clone(), current.pages.clone());
+        }
         self.update_header(&note);
         self.update_view(self.canvas.view_info());
         self.stack.set_visible_child_name("canvas");
@@ -1518,7 +1575,7 @@ impl App {
             NoteKind::Pdf => "",
         };
         let note = Note::new(kind, title);
-        if let Err(error) = self.store.borrow().save(&note) {
+        if let Err(error) = self.store.borrow().save_all(&note) {
             self.toast(&error);
             return;
         }
@@ -1578,7 +1635,7 @@ impl App {
                         return;
                     }
                 }
-                if let Err(error) = app.store.borrow().save(&note) {
+                if let Err(error) = app.store.borrow().save_all(&note) {
                     app.toast(&error);
                     return;
                 }
@@ -1606,48 +1663,68 @@ impl App {
         self.zoom_pill.set_visible(false);
         self.undo_btn.set_sensitive(false);
         self.redo_btn.set_sensitive(false);
+        self.save_btn.set_sensitive(false);
         self.note_list.unselect_all();
     }
 
-    fn schedule_save(self: &Rc<Self>, note: Note) {
-        {
-            let mut st = self.state.borrow_mut();
-            st.pending.insert(note.id.clone(), note);
-            if st.save_source.is_some() {
-                return;
+    fn queue_save(&self, note: Note) {
+        self.state
+            .borrow_mut()
+            .pending
+            .insert(note.id.clone(), note);
+    }
+
+    fn save_now(self: &Rc<Self>) {
+        let had_changes = !self.state.borrow().pending.is_empty();
+        if self.flush_saves() {
+            if had_changes {
+                self.toast("保存しました");
+            } else {
+                self.toast("保存する変更はありません");
             }
-            let weak = Rc::downgrade(self);
-            st.save_source = Some(glib::timeout_add_local_once(
-                Duration::from_millis(520),
-                move || {
-                    if let Some(app) = weak.upgrade() {
-                        app.state.borrow_mut().save_source = None;
-                        app.flush_saves();
-                    }
-                },
-            ));
         }
     }
 
-    fn flush_saves(&self) {
+    /// Write pending notes. Returns true when everything was saved.
+    fn flush_saves(&self) -> bool {
         let pending: Vec<Note> = {
             let mut st = self.state.borrow_mut();
             if st.pending.is_empty() {
-                return;
+                return true;
             }
             st.pending.drain().map(|(_, note)| note).collect()
         };
+        let mut ok = true;
+        let mut failed = Vec::new();
         let mut error_message = None;
         for note in pending {
-            if let Err(error) = self.store.borrow().save(&note) {
-                error_message = Some(error);
-                continue;
+            let saved = self.state.borrow().saved_pages.get(&note.id).cloned();
+            let dirty = dirty_page_indices(saved.as_deref(), &note.pages);
+            match self.store.borrow().save(&note, &dirty) {
+                Ok(()) => {
+                    self.state
+                        .borrow_mut()
+                        .saved_pages
+                        .insert(note.id.clone(), note.pages.clone());
+                    self.update_row(&note);
+                }
+                Err(error) => {
+                    ok = false;
+                    error_message = Some(error);
+                    failed.push(note);
+                }
             }
-            self.update_row(&note);
+        }
+        if !failed.is_empty() {
+            let mut st = self.state.borrow_mut();
+            for note in failed {
+                st.pending.insert(note.id.clone(), note);
+            }
         }
         if let Some(error) = error_message {
             self.toast(&error);
         }
+        ok
     }
 
     fn update_view(&self, info: ViewInfo) {
@@ -1658,6 +1735,7 @@ impl App {
         self.zoom_pill.set_visible(has_note);
         self.undo_btn.set_sensitive(info.can_undo);
         self.redo_btn.set_sensitive(info.can_redo);
+        self.save_btn.set_sensitive(has_note);
 
         let show_pages = has_note && info.kind != Some(NoteKind::Infinite);
         self.page_pill.set_visible(show_pages);
@@ -1842,7 +1920,7 @@ impl App {
             if let Some(note) = app.canvas.note() {
                 app.update_header(&note);
                 app.update_row(&note);
-                app.schedule_save(note);
+                app.queue_save(note);
             }
             app.canvas.area.grab_focus();
         });
@@ -1881,6 +1959,7 @@ impl App {
             {
                 let mut st = app.state.borrow_mut();
                 st.pending.remove(&id);
+                st.saved_pages.remove(&id);
                 st.metas.retain(|m| m.id != id);
                 st.active_id = None;
                 st.active_kind = None;
@@ -2006,6 +2085,17 @@ fn menu_button(icon: &str, label: &str, subtitle: &str) -> gtk::Button {
     button
 }
 
+fn dirty_page_indices(saved: Option<&[Page]>, pages: &[Page]) -> Vec<usize> {
+    match saved {
+        Some(old) => pages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, page)| (old.get(index) != Some(page)).then_some(index))
+            .collect(),
+        None => (0..pages.len()).collect(),
+    }
+}
+
 fn text_focus(window: &impl IsA<gtk::Window>) -> bool {
     let window: &gtk::Window = window.upcast_ref();
     let mut widget = gtk::prelude::GtkWindowExt::focus(window);
@@ -2016,4 +2106,42 @@ fn text_focus(window: &impl IsA<gtk::Window>) -> bool {
         widget = current.parent();
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Point, Stroke, StrokeTool};
+
+    fn page_with_x(x: f64) -> Page {
+        Page {
+            strokes: vec![Stroke {
+                id: 1,
+                tool: StrokeTool::Pen,
+                color: "#000000".into(),
+                width: 3.0,
+                points: vec![Point { x, y: 1.0, p: 0.5 }],
+            }],
+        }
+    }
+
+    #[test]
+    fn only_changed_pages_are_dirty() {
+        let a = page_with_x(1.0);
+        let b = page_with_x(2.0);
+        let c = page_with_x(3.0);
+        assert_eq!(
+            dirty_page_indices(Some(&[a.clone(), b.clone()]), &[a.clone(), c.clone()]),
+            vec![1]
+        );
+        assert_eq!(
+            dirty_page_indices(Some(&[a.clone()]), &[a.clone(), b.clone()]),
+            vec![1]
+        );
+        assert_eq!(
+            dirty_page_indices(None, &[a.clone(), b.clone()]),
+            vec![0, 1]
+        );
+        assert!(dirty_page_indices(Some(&[a.clone(), b.clone()]), &[a]).is_empty());
+    }
 }
