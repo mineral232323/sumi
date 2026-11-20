@@ -1566,9 +1566,11 @@ impl State {
                                     if let Some(path) = self.path_cache.get(&(page, index)) {
                                         ctx.new_path();
                                         ctx.append_path(path);
-                                        let (r, g, b) = hex_to_cairo(&stroke.color);
-                                        ctx.set_source_rgba(r, g, b, 0.18);
-                                        let _ = ctx.fill();
+                                        ctx.set_line_width((stroke.width + 0.5).max(0.4));
+                                        ctx.set_line_cap(cairo::LineCap::Round);
+                                        ctx.set_line_join(cairo::LineJoin::Round);
+                                        ctx.set_source_rgba(0.58, 0.60, 0.63, 1.0);
+                                        let _ = ctx.stroke();
                                     }
                                 }
                             }
