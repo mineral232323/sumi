@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::model::{Note, NoteKind, NoteMeta, Page};
+use crate::model::{Note, NoteKind, NoteMeta, Page, ToolSettings};
 
 pub struct Store {
     conn: Connection,
@@ -46,10 +46,43 @@ impl Store {
                 page_index INTEGER NOT NULL,
                 data TEXT NOT NULL,
                 PRIMARY KEY (note_id, page_index)
+             );
+             CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
              );",
         )
         .map_err(|e| format!("データベースを初期化できません: {e}"))?;
         Ok(Self { conn, pdf_dir })
+    }
+
+    /// Global tool settings shared by every note. Missing or broken values
+    /// fall back to the built-in defaults.
+    pub fn load_tool_settings(&self) -> ToolSettings {
+        self.conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'tool'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .and_then(|json| serde_json::from_str::<ToolSettings>(&json).ok())
+            .unwrap_or_default()
+            .sanitized()
+    }
+
+    pub fn save_tool_settings(&self, settings: &ToolSettings) -> Result<(), String> {
+        let json = serde_json::to_string(settings).map_err(|e| e.to_string())?;
+        self.conn
+            .execute(
+                "INSERT INTO settings (key, value) VALUES ('tool', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![json],
+            )
+            .map_err(|e| format!("設定を保存できません: {e}"))?;
+        Ok(())
     }
 
     pub fn list(&self) -> Result<Vec<NoteMeta>, String> {
@@ -283,7 +316,9 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Point, Stroke, StrokeTool};
+    use crate::model::{
+        Point, Stroke, StrokeTool, HIGHLIGHTER_SIZE_RANGE, PEN_SIZE_RANGE,
+    };
 
     fn temp_store() -> (Store, PathBuf) {
         let dir = std::env::temp_dir().join(format!("sumi-test-{}", uuid::Uuid::new_v4()));
@@ -339,6 +374,40 @@ mod tests {
         store.save(&changed, &[1]).unwrap();
         let loaded = store.load(&note.id).unwrap();
         assert_eq!(loaded.pages, changed.pages);
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stores_tool_settings_globally() {
+        let (store, dir) = temp_store();
+        assert_eq!(store.load_tool_settings(), ToolSettings::default());
+
+        let settings = ToolSettings {
+            pen_size: 7.5,
+            highlighter_size: 30.0,
+            eraser_size: 40.0,
+        };
+        store.save_tool_settings(&settings).unwrap();
+        assert_eq!(store.load_tool_settings(), settings);
+
+        // Later notes and pages see the same values.
+        let note = test_note();
+        store.save_all(&note).unwrap();
+        assert_eq!(store.load_tool_settings(), settings);
+
+        // Out-of-range values are clamped on load.
+        store
+            .conn
+            .execute(
+                "UPDATE settings SET value = ?1 WHERE key = 'tool'",
+                params!["{\"pen_size\":100.0,\"highlighter_size\":-4.0,\"eraser_size\":26.0}"],
+            )
+            .unwrap();
+        let loaded = store.load_tool_settings();
+        assert_eq!(loaded.pen_size, PEN_SIZE_RANGE.1);
+        assert_eq!(loaded.highlighter_size, HIGHLIGHTER_SIZE_RANGE.0);
+        assert_eq!(loaded.eraser_size, 26.0);
         drop(store);
         let _ = fs::remove_dir_all(dir);
     }

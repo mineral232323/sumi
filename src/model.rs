@@ -6,6 +6,11 @@ pub const A4_RATIO: f64 = 297.0 / 210.0;
 pub const PAGE_GAP: f64 = 56.0;
 pub const INFINITE_GRID: f64 = 28.0;
 
+/// Stroke width limits for each tool, shared by the toolbar and the canvas.
+pub const PEN_SIZE_RANGE: (f64, f64) = (0.8, 14.0);
+pub const HIGHLIGHTER_SIZE_RANGE: (f64, f64) = (8.0, 44.0);
+pub const ERASER_SIZE_RANGE: (f64, f64) = (8.0, 60.0);
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum NoteKind {
@@ -47,6 +52,52 @@ impl NoteKind {
             _ => Self::Infinite,
         }
     }
+}
+
+/// User-wide tool settings. They apply to every note and every page, and are
+/// stored outside the notes so a fresh note starts with the last used widths.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(default)]
+pub struct ToolSettings {
+    pub pen_size: f64,
+    pub highlighter_size: f64,
+    pub eraser_size: f64,
+}
+
+impl Default for ToolSettings {
+    fn default() -> Self {
+        Self {
+            pen_size: 3.2,
+            highlighter_size: 20.0,
+            eraser_size: 26.0,
+        }
+    }
+}
+
+impl ToolSettings {
+    /// Clamp stored values into the ranges the toolbar offers.
+    pub fn sanitized(self) -> Self {
+        Self {
+            pen_size: clamp_size(self.pen_size, PEN_SIZE_RANGE, Self::default().pen_size),
+            highlighter_size: clamp_size(
+                self.highlighter_size,
+                HIGHLIGHTER_SIZE_RANGE,
+                Self::default().highlighter_size,
+            ),
+            eraser_size: clamp_size(
+                self.eraser_size,
+                ERASER_SIZE_RANGE,
+                Self::default().eraser_size,
+            ),
+        }
+    }
+}
+
+fn clamp_size(value: f64, range: (f64, f64), fallback: f64) -> f64 {
+    if !value.is_finite() {
+        return fallback;
+    }
+    value.clamp(range.0, range.1)
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]

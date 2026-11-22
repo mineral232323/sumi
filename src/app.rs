@@ -13,7 +13,10 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::canvas::{Canvas, Tool, ViewInfo};
-use crate::model::{now_secs, Note, NoteKind, NoteMeta, Page};
+use crate::model::{
+    now_secs, Note, NoteKind, NoteMeta, Page, ToolSettings, ERASER_SIZE_RANGE,
+    HIGHLIGHTER_SIZE_RANGE, PEN_SIZE_RANGE,
+};
 use crate::pdf::{self, PdfDoc};
 use crate::store::Store;
 
@@ -219,7 +222,7 @@ struct AppState {
 }
 
 impl AppState {
-    fn new() -> Self {
+    fn new(settings: ToolSettings) -> Self {
         Self {
             metas: Vec::new(),
             displayed: Vec::new(),
@@ -230,14 +233,22 @@ impl AppState {
             last_non_eraser: Tool::Pen,
             pen_color: PEN_COLORS[0].1.to_string(),
             highlight_color: HIGHLIGHT_COLORS[0].1.to_string(),
-            pen_size: 3.2,
-            highlighter_size: 20.0,
-            eraser_size: 26.0,
+            pen_size: settings.pen_size,
+            highlighter_size: settings.highlighter_size,
+            eraser_size: settings.eraser_size,
             pending: HashMap::new(),
             saved_pages: HashMap::new(),
             rebuilding: false,
             adjusting: false,
             syncing_toggle: false,
+        }
+    }
+
+    fn tool_settings(&self) -> ToolSettings {
+        ToolSettings {
+            pen_size: self.pen_size,
+            highlighter_size: self.highlighter_size,
+            eraser_size: self.eraser_size,
         }
     }
 }
@@ -283,6 +294,7 @@ pub fn build(application: &adw::Application) {
             return;
         }
     };
+    let stored_settings = store.load_tool_settings();
 
     let window = adw::ApplicationWindow::builder()
         .application(application)
@@ -472,10 +484,11 @@ pub fn build(application: &adw::Application) {
         next_btn,
         add_page_btn,
         store: RefCell::new(store),
-        state: RefCell::new(AppState::new()),
+        state: RefCell::new(AppState::new(stored_settings)),
     });
 
     app.wire();
+    app.restore_tool_settings();
     app.window.present();
     APP_HOLDER.with(|slot| {
         *slot.borrow_mut() = Some(app);
@@ -736,6 +749,7 @@ impl App {
                             Tool::Select | Tool::Hand => {}
                         }
                     }
+                    app.persist_tool_settings();
                     match tool {
                         Tool::Pen => app.canvas.set_pen_size(value),
                         Tool::Highlighter => app.canvas.set_highlighter_size(value),
@@ -1781,6 +1795,23 @@ impl App {
         }
     }
 
+    /// Apply the persisted global tool widths to the canvas at startup.
+    fn restore_tool_settings(&self) {
+        let settings = self.state.borrow().tool_settings();
+        self.canvas.set_pen_size(settings.pen_size);
+        self.canvas.set_highlighter_size(settings.highlighter_size);
+        self.canvas.set_eraser_size(settings.eraser_size);
+        self.update_tool_ui();
+    }
+
+    /// Write the current tool widths so the next note, page and launch reuse them.
+    fn persist_tool_settings(&self) {
+        let settings = self.state.borrow().tool_settings();
+        if let Err(error) = self.store.borrow().save_tool_settings(&settings) {
+            eprintln!("[sumi:settings] {error}");
+        }
+    }
+
     fn apply_tool(&self, tool: Tool) {
         {
             let mut st = self.state.borrow_mut();
@@ -1851,10 +1882,14 @@ impl App {
         self.toolbar.size_value.set_visible(show_size);
 
         let (lower, upper, value) = match tool {
-            Tool::Pen => (0.8, 14.0, pen_size),
-            Tool::Highlighter => (8.0, 44.0, highlighter_size),
-            Tool::Eraser => (8.0, 60.0, eraser_size),
-            Tool::Select | Tool::Hand => (0.8, 14.0, pen_size),
+            Tool::Pen => (PEN_SIZE_RANGE.0, PEN_SIZE_RANGE.1, pen_size),
+            Tool::Highlighter => (
+                HIGHLIGHTER_SIZE_RANGE.0,
+                HIGHLIGHTER_SIZE_RANGE.1,
+                highlighter_size,
+            ),
+            Tool::Eraser => (ERASER_SIZE_RANGE.0, ERASER_SIZE_RANGE.1, eraser_size),
+            Tool::Select | Tool::Hand => (PEN_SIZE_RANGE.0, PEN_SIZE_RANGE.1, pen_size),
         };
         {
             let mut st = self.state.borrow_mut();
