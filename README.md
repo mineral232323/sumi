@@ -87,6 +87,19 @@ curl -fsSL https://raw.githubusercontent.com/mineral232323/sumi/main/get.sh \
   | SUMI_REF=v0.1.0 sh
 ```
 
+### GNOME のアプリ一覧に出ないとき
+
+- `sudo ./install.sh` で入れていないか確認してください。`sudo` だと `/root/.local` に入り、GNOME のアプリ一覧には出ません
+- `XDG_DATA_HOME` を設定している場合は、その配下にデスクトップエントリとアイコンが入ります
+- インストール後に一度ログアウトして再ログインしてください（GNOME Shell のアプリ一覧キャッシュが残ることがあります）
+- 次のコマンドで起動できるか確認できます
+
+```sh
+ls ~/.local/share/applications/com.ryouta.Sumi.desktop
+desktop-file-validate ~/.local/share/applications/com.ryouta.Sumi.desktop
+gtk-launch com.ryouta.Sumi
+```
+
 ## ショートカット
 
 | キー | 動作 |
