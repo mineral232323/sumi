@@ -11,8 +11,8 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use crate::model::{
-    hex_to_cairo, Note, NoteKind, Page, Point, Rect, Stroke, StrokeTool, A4_RATIO, INFINITE_GRID,
-    PAGE_WIDTH,
+    hex_to_cairo, Note, NoteKind, Page, Point, Rect, ShapeKind, Stroke, StrokeTool, A4_RATIO,
+    INFINITE_GRID, PAGE_WIDTH,
 };
 use crate::pdf::PdfDoc;
 
@@ -84,6 +84,7 @@ pub enum Tool {
     Pen,
     Highlighter,
     Eraser,
+    Shape,
     Select,
     Hand,
 }
@@ -139,6 +140,11 @@ enum Interaction {
         start: (f64, f64),
         current: (f64, f64),
         additive: bool,
+    },
+    Shape {
+        page: usize,
+        start: (f64, f64),
+        current: (f64, f64),
     },
     MoveSelection {
         page: usize,
@@ -203,6 +209,7 @@ struct State {
     pen_size: f64,
     highlighter_size: f64,
     eraser_size: f64,
+    shape_kind: ShapeKind,
 
     interaction: Interaction,
     cursor: Option<(f64, f64)>,
@@ -252,6 +259,7 @@ impl State {
             pen_size: 3.2,
             highlighter_size: 20.0,
             eraser_size: 26.0,
+            shape_kind: ShapeKind::Line,
             interaction: Interaction::None,
             cursor: None,
             space_down: false,
@@ -286,6 +294,7 @@ impl State {
             Tool::Pen => self.pen_size,
             Tool::Highlighter => self.highlighter_size,
             Tool::Eraser => self.eraser_size,
+            Tool::Shape => self.pen_size,
             Tool::Select | Tool::Hand => self.pen_size,
         }
     }
@@ -1398,7 +1407,10 @@ impl Canvas {
 
     /// Give the selected strokes a new color. Returns false when nothing changed.
     pub fn recolor_selection(&self, color: &str, highlighter: bool) -> bool {
-        let changed = self.state.borrow_mut().recolor_selection(color, highlighter);
+        let changed = self
+            .state
+            .borrow_mut()
+            .recolor_selection(color, highlighter);
         if changed {
             self.area.queue_draw();
             emit_view(&self.state);
@@ -1417,6 +1429,10 @@ impl Canvas {
 
     pub fn set_eraser_size(&self, size: f64) {
         self.state.borrow_mut().eraser_size = size;
+    }
+
+    pub fn set_shape_kind(&self, kind: ShapeKind) {
+        self.state.borrow_mut().shape_kind = kind;
     }
 
     pub fn set_space_down(&self, down: bool) {
@@ -1647,11 +1663,7 @@ impl State {
                         continue;
                     };
                     found = true;
-                    stroke.color = if forward {
-                        color.clone()
-                    } else {
-                        old.clone()
-                    };
+                    stroke.color = if forward { color.clone() } else { old.clone() };
                 }
                 found
             }
@@ -1798,12 +1810,20 @@ fn pointer_down(s: &mut State, x: f64, y: f64, pressure: f64, additive: bool) {
                     y: cy,
                     p: pressure,
                 }],
+                shape: None,
             };
             s.interaction = Interaction::Stroke { page, stroke };
         }
         Tool::Eraser => {
             let hit = erase_hits(note, page, wx, wy, s.eraser_size / 2.0 / s.camera.zoom);
             s.interaction = Interaction::Erase { page, hit };
+        }
+        Tool::Shape => {
+            s.interaction = Interaction::Shape {
+                page,
+                start: (cx, cy),
+                current: (cx, cy),
+            };
         }
         Tool::Select => {
             if s.selection_page != Some(page) {
@@ -1920,6 +1940,13 @@ fn pointer_move(s: &mut State, x: f64, y: f64, pressure: f64) {
         }
         Interaction::Select { current, .. } => {
             *current = (wx, wy);
+        }
+        Interaction::Shape { page, current, .. } => {
+            let Some(note) = &s.note else {
+                return;
+            };
+            *current = note.clamp_to_page(&s.layout, *page, wx, wy);
+            s.cache_dirty = true;
         }
         Interaction::MoveSelection {
             page,
@@ -2043,6 +2070,55 @@ fn pointer_up(s: &mut State, x: f64, y: f64, _pressure: f64) -> bool {
             s.invalidate_ink();
             true
         }
+        Interaction::Shape {
+            page,
+            start,
+            current,
+        } => {
+            let scale = s.camera.zoom.max(0.01);
+            let dx = current.0 - start.0;
+            let dy = current.1 - start.1;
+            if (dx * dx + dy * dy).sqrt() * scale < 3.0 {
+                s.cache_dirty = true;
+                return false;
+            }
+            let stroke = Stroke {
+                id: next_stroke_id(),
+                tool: StrokeTool::Pen,
+                color: s.color.clone(),
+                width: s.pen_size,
+                points: vec![
+                    Point {
+                        x: start.0,
+                        y: start.1,
+                        p: 0.5,
+                    },
+                    Point {
+                        x: current.0,
+                        y: current.1,
+                        p: 0.5,
+                    },
+                ],
+                shape: Some(s.shape_kind),
+            };
+            let Some(note) = &mut s.note else {
+                return false;
+            };
+            let Some(page_data) = note.pages.get_mut(page) else {
+                return false;
+            };
+            let index = page_data.strokes.len();
+            page_data.strokes.push(stroke.clone());
+            note.touch();
+            s.undo.push(Action::AddStroke {
+                page,
+                index,
+                stroke,
+            });
+            s.redo.clear();
+            s.invalidate_ink();
+            true
+        }
         Interaction::Select {
             page,
             start,
@@ -2131,6 +2207,14 @@ fn stroke_hit(stroke: &Stroke, x: f64, y: f64, threshold: f64) -> bool {
     if stroke.points.is_empty() {
         return false;
     }
+    if let Some(kind) = stroke.shape {
+        if shape_contains(kind, &stroke.points, x, y) {
+            return true;
+        }
+        return shape_segments(kind, &stroke.points)
+            .iter()
+            .any(|seg| segment_dist2(seg.0 .0, seg.0 .1, seg.1 .0, seg.1 .1, x, y) <= t2);
+    }
     if stroke.points.len() == 1 {
         let p = &stroke.points[0];
         return (p.x - x).powi(2) + (p.y - y).powi(2) <= t2;
@@ -2192,6 +2276,27 @@ fn stroke_intersects_rect(stroke: &Stroke, rect: Rect) -> bool {
     };
     if !bounds.intersects(rect.x, rect.y, rect.w, rect.h) {
         return false;
+    }
+    if let Some(kind) = stroke.shape {
+        // A marquee inside the shape, or around the whole shape, still selects it.
+        if shape_contains(
+            kind,
+            &stroke.points,
+            rect.x + rect.w * 0.5,
+            rect.y + rect.h * 0.5,
+        ) {
+            return true;
+        }
+        if rect.x <= bounds.x
+            && rect.y <= bounds.y
+            && rect.x + rect.w >= bounds.x + bounds.w
+            && rect.y + rect.h >= bounds.y + bounds.h
+        {
+            return true;
+        }
+        return shape_segments(kind, &stroke.points)
+            .iter()
+            .any(|seg| segment_rect_intersects(seg.0 .0, seg.0 .1, seg.1 .0, seg.1 .1, rect));
     }
     if stroke.points.len() == 1 {
         let p = &stroke.points[0];
@@ -2614,6 +2719,32 @@ impl State {
         }
         let live = match &self.interaction {
             Interaction::Stroke { page, stroke } => Some((*page, LiveItem::Stroke(stroke.clone()))),
+            Interaction::Shape {
+                page,
+                start,
+                current,
+            } => {
+                let stroke = Stroke {
+                    id: 0,
+                    tool: StrokeTool::Pen,
+                    color: self.color.clone(),
+                    width: self.pen_size,
+                    points: vec![
+                        Point {
+                            x: start.0,
+                            y: start.1,
+                            p: 0.5,
+                        },
+                        Point {
+                            x: current.0,
+                            y: current.1,
+                            p: 0.5,
+                        },
+                    ],
+                    shape: Some(self.shape_kind),
+                };
+                Some((*page, LiveItem::Stroke(stroke)))
+            }
             Interaction::Erase { page, hit } => Some((*page, LiveItem::Erase(hit.clone()))),
             _ => None,
         };
@@ -2776,6 +2907,7 @@ impl State {
                     Tool::Pen => (self.pen_size * zoom * 0.5).max(2.0),
                     Tool::Highlighter => (self.highlighter_size * zoom * 0.5).max(4.0),
                     Tool::Eraser => self.eraser_size * 0.5,
+                    Tool::Shape => (self.pen_size * zoom * 0.5).max(2.0),
                     Tool::Select => 4.0,
                     Tool::Hand => 7.0,
                 }
@@ -2820,10 +2952,140 @@ fn rounded_rect(ctx: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
     ctx.close_path();
 }
 
+/// Normalized bounding box of a shape gesture: (left, top, right, bottom).
+fn shape_box(points: &[Point]) -> Option<(f64, f64, f64, f64)> {
+    let a = points.first()?;
+    let b = points.get(1).unwrap_or(a);
+    Some((a.x.min(b.x), a.y.min(b.y), a.x.max(b.x), a.y.max(b.y)))
+}
+
+fn append_shape_path(ctx: &Context, kind: ShapeKind, points: &[Point]) {
+    let Some((x0, y0, x1, y1)) = shape_box(points) else {
+        return;
+    };
+    match kind {
+        ShapeKind::Line => {
+            let a = points[0];
+            let b = points.get(1).copied().unwrap_or(a);
+            ctx.move_to(a.x, a.y);
+            ctx.line_to(b.x, b.y);
+        }
+        ShapeKind::Rect => {
+            ctx.move_to(x0, y0);
+            ctx.line_to(x1, y0);
+            ctx.line_to(x1, y1);
+            ctx.line_to(x0, y1);
+            ctx.close_path();
+        }
+        ShapeKind::Ellipse => {
+            let cx = (x0 + x1) * 0.5;
+            let cy = (y0 + y1) * 0.5;
+            let rx = ((x1 - x0) * 0.5).max(0.01);
+            let ry = ((y1 - y0) * 0.5).max(0.01);
+            let _ = ctx.save();
+            let _ = ctx.translate(cx, cy);
+            let _ = ctx.scale(rx, ry);
+            ctx.arc(0.0, 0.0, 1.0, 0.0, TAU);
+            let _ = ctx.restore();
+            ctx.close_path();
+        }
+        ShapeKind::Triangle => {
+            let cx = (x0 + x1) * 0.5;
+            ctx.move_to(cx, y0);
+            ctx.line_to(x1, y1);
+            ctx.line_to(x0, y1);
+            ctx.close_path();
+        }
+    }
+}
+
+/// Outline of a shape as a closed polyline, used for hit testing.
+fn shape_polygon(kind: ShapeKind, points: &[Point]) -> Vec<(f64, f64)> {
+    let Some((x0, y0, x1, y1)) = shape_box(points) else {
+        return Vec::new();
+    };
+    match kind {
+        ShapeKind::Line => {
+            let a = points[0];
+            let b = points.get(1).copied().unwrap_or(a);
+            vec![(a.x, a.y), (b.x, b.y)]
+        }
+        ShapeKind::Rect => vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)],
+        ShapeKind::Ellipse => {
+            let cx = (x0 + x1) * 0.5;
+            let cy = (y0 + y1) * 0.5;
+            let rx = (x1 - x0) * 0.5;
+            let ry = (y1 - y0) * 0.5;
+            const STEPS: usize = 64;
+            (0..=STEPS)
+                .map(|step| {
+                    let angle = TAU * step as f64 / STEPS as f64;
+                    (cx + rx * angle.cos(), cy + ry * angle.sin())
+                })
+                .collect()
+        }
+        ShapeKind::Triangle => {
+            let cx = (x0 + x1) * 0.5;
+            vec![(cx, y0), (x1, y1), (x0, y1), (cx, y0)]
+        }
+    }
+}
+
+fn shape_segments(kind: ShapeKind, points: &[Point]) -> Vec<((f64, f64), (f64, f64))> {
+    shape_polygon(kind, points)
+        .windows(2)
+        .map(|pair| (pair[0], pair[1]))
+        .collect()
+}
+
+/// Whether a point falls inside the area a shape encloses (tapping a rectangle
+/// selects it, tapping a line does not).
+fn shape_contains(kind: ShapeKind, points: &[Point], x: f64, y: f64) -> bool {
+    let Some((x0, y0, x1, y1)) = shape_box(points) else {
+        return false;
+    };
+    match kind {
+        ShapeKind::Line => false,
+        ShapeKind::Rect => x >= x0 && x <= x1 && y >= y0 && y <= y1,
+        ShapeKind::Ellipse => {
+            let cx = (x0 + x1) * 0.5;
+            let cy = (y0 + y1) * 0.5;
+            let rx = (x1 - x0) * 0.5;
+            let ry = (y1 - y0) * 0.5;
+            if rx < 1e-6 || ry < 1e-6 {
+                return false;
+            }
+            let nx = (x - cx) / rx;
+            let ny = (y - cy) / ry;
+            nx * nx + ny * ny <= 1.0
+        }
+        ShapeKind::Triangle => polygon_contains(&shape_polygon(kind, points), x, y),
+    }
+}
+
+fn polygon_contains(polygon: &[(f64, f64)], x: f64, y: f64) -> bool {
+    let mut inside = false;
+    for pair in polygon.windows(2) {
+        let (x1, y1) = pair[0];
+        let (x2, y2) = pair[1];
+        if (y1 > y) != (y2 > y) {
+            let t = (y - y1) / (y2 - y1);
+            if x < x1 + t * (x2 - x1) {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
 /// Cheap path for the in-progress stroke: one cubic per input point instead of
 /// resampling the whole line at sub-pixel intervals on every motion event.
 /// The committed stroke is rebuilt at full quality when the pen is lifted.
 fn build_live_stroke_path(ctx: &Context, stroke: &Stroke) {
+    if let Some(kind) = stroke.shape {
+        append_shape_path(ctx, kind, &stroke.points);
+        return;
+    }
     let points = smooth_points(&stroke.points);
     if points.is_empty() {
         return;
@@ -2839,6 +3101,10 @@ fn build_live_stroke_path(ctx: &Context, stroke: &Stroke) {
 }
 
 fn build_stroke_path(ctx: &Context, stroke: &Stroke) {
+    if let Some(kind) = stroke.shape {
+        append_shape_path(ctx, kind, &stroke.points);
+        return;
+    }
     let samples = stroke_samples(stroke);
     if samples.is_empty() {
         return;
@@ -2990,6 +3256,7 @@ mod tests {
                     p: 0.5,
                 },
             ],
+            shape: None,
         });
         state.layout = note.layout();
         state.note = Some(note);
@@ -3060,6 +3327,7 @@ mod tests {
                     p: 0.5,
                 },
             ],
+            shape: None,
         });
         state.selection = vec![1, 2];
         state.selection_page = Some(0);
@@ -3115,5 +3383,155 @@ mod tests {
         };
         assert!(segment_rect_intersects(0.0, 0.0, 20.0, 20.0, rect));
         assert!(!segment_rect_intersects(0.0, 20.0, 20.0, 20.0, rect));
+    }
+
+    fn state_for_shapes() -> State {
+        let mut state = State::new();
+        let note = Note::new(NoteKind::Paged, "shapes");
+        state.layout = note.layout();
+        state.note = Some(note);
+        state.tool = Tool::Shape;
+        state
+    }
+
+    fn draw_shape(state: &mut State, kind: ShapeKind, from: (f64, f64), to: (f64, f64)) -> bool {
+        state.shape_kind = kind;
+        pointer_down(state, from.0, from.1, 0.5, false);
+        pointer_move(state, to.0, to.1, 0.5);
+        pointer_up(state, to.0, to.1, 0.5)
+    }
+
+    #[test]
+    fn shape_tool_draws_and_undoes_each_shape() {
+        for kind in ShapeKind::ALL {
+            let mut state = state_for_shapes();
+            assert!(draw_shape(&mut state, kind, (100.0, 100.0), (240.0, 180.0)));
+            let color = state.color.clone();
+            let strokes = &state.note.as_ref().unwrap().pages[0].strokes;
+            assert_eq!(strokes.len(), 1, "{kind:?}");
+            assert_eq!(strokes[0].shape, Some(kind));
+            assert_eq!(strokes[0].points.len(), 2);
+            assert_eq!(strokes[0].color, color);
+
+            let action = state.undo.pop().unwrap();
+            assert!(state.apply_action(&action, false));
+            assert!(state.note.as_ref().unwrap().pages[0].strokes.is_empty());
+        }
+    }
+
+    #[test]
+    fn tiny_shape_gestures_are_ignored() {
+        let mut state = state_for_shapes();
+        assert!(!draw_shape(
+            &mut state,
+            ShapeKind::Line,
+            (100.0, 100.0),
+            (100.5, 100.5)
+        ));
+        assert!(state.note.as_ref().unwrap().pages[0].strokes.is_empty());
+        assert!(state.undo.is_empty());
+    }
+
+    #[test]
+    fn shapes_can_be_hit_tested_and_selected() {
+        let mut state = state_for_shapes();
+        assert!(draw_shape(
+            &mut state,
+            ShapeKind::Rect,
+            (10.0, 10.0),
+            (110.0, 60.0)
+        ));
+        assert!(draw_shape(
+            &mut state,
+            ShapeKind::Ellipse,
+            (200.0, 10.0),
+            (280.0, 70.0)
+        ));
+        let strokes = &state.note.as_ref().unwrap().pages[0].strokes;
+        let (rect, ellipse) = (&strokes[0], &strokes[1]);
+        let rect_id = rect.id;
+
+        // The outline is a hit, and so is the enclosed area.
+        assert!(stroke_hit(rect, 10.0, 35.0, 2.0));
+        assert!(stroke_hit(rect, 60.0, 35.0, 2.0));
+        assert!(!stroke_hit(rect, 160.0, 35.0, 2.0));
+        assert!(stroke_hit(ellipse, 240.0, 40.0, 2.0));
+        assert!(!stroke_hit(ellipse, 202.0, 12.0, 2.0));
+
+        let marquee = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 130.0,
+            h: 80.0,
+        };
+        assert!(stroke_intersects_rect(rect, marquee));
+        assert!(!stroke_intersects_rect(ellipse, marquee));
+
+        state.tool = Tool::Select;
+        select_click(&mut state, 60.0, 35.0, false);
+        assert_eq!(state.selection, vec![rect_id]);
+    }
+
+    /// Draws one shape outline into a 100x100 surface, so the rendered pixels
+    /// can be probed without a window.
+    fn rasterize(kind: ShapeKind, from: (f64, f64), to: (f64, f64)) -> ImageSurface {
+        let surface = ImageSurface::create(Format::A8, 100, 100).unwrap();
+        let ctx = Context::new(&surface).unwrap();
+        ctx.set_line_width(1.0);
+        let points = [
+            Point {
+                x: from.0,
+                y: from.1,
+                p: 0.5,
+            },
+            Point {
+                x: to.0,
+                y: to.1,
+                p: 0.5,
+            },
+        ];
+        append_shape_path(&ctx, kind, &points);
+        ctx.stroke().unwrap();
+        drop(ctx);
+        surface.flush();
+        surface
+    }
+
+    /// Whether any ink landed within two pixels of the point.
+    fn ink_near(surface: &mut ImageSurface, x: usize, y: usize) -> bool {
+        let stride = surface.stride() as usize;
+        let data = surface.data().unwrap();
+        let (x0, x1) = (x.saturating_sub(2), (x + 2).min(99));
+        let (y0, y1) = (y.saturating_sub(2), (y + 2).min(99));
+        (y0..=y1).any(|row| (x0..=x1).any(|col| data[row * stride + col] > 96))
+    }
+
+    #[test]
+    fn each_shape_kind_is_drawn_where_expected() {
+        let mut line = rasterize(ShapeKind::Line, (10.0, 10.0), (90.0, 90.0));
+        assert!(ink_near(&mut line, 50, 50));
+        assert!(ink_near(&mut line, 90, 90));
+        assert!(!ink_near(&mut line, 50, 20));
+
+        let mut rect = rasterize(ShapeKind::Rect, (10.0, 10.0), (90.0, 90.0));
+        for (x, y) in [(50, 10), (90, 50), (50, 90), (10, 50)] {
+            assert!(ink_near(&mut rect, x, y), "rect edge at {x},{y}");
+        }
+        assert!(!ink_near(&mut rect, 50, 50));
+
+        let mut ellipse = rasterize(ShapeKind::Ellipse, (10.0, 10.0), (90.0, 90.0));
+        for (x, y) in [(50, 10), (90, 50), (50, 90), (10, 50)] {
+            assert!(ink_near(&mut ellipse, x, y), "ellipse rim at {x},{y}");
+        }
+        // The corners of the bounding box stay empty, unlike a rectangle.
+        assert!(!ink_near(&mut ellipse, 12, 12));
+        assert!(!ink_near(&mut ellipse, 50, 50));
+
+        let mut triangle = rasterize(ShapeKind::Triangle, (10.0, 10.0), (90.0, 90.0));
+        for (x, y) in [(50, 10), (90, 90), (10, 90), (30, 50), (70, 50)] {
+            assert!(ink_near(&mut triangle, x, y), "triangle edge at {x},{y}");
+        }
+        assert!(!ink_near(&mut triangle, 50, 75));
+        assert!(!ink_near(&mut triangle, 12, 12));
     }
 }

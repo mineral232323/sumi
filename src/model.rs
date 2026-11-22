@@ -107,6 +107,44 @@ pub enum StrokeTool {
     Highlighter,
 }
 
+/// Geometric shapes drawn by the shape tool. A shape stroke stores the gesture
+/// start and end in `points`, and the shape its outline is built from.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ShapeKind {
+    Line,
+    Rect,
+    Ellipse,
+    Triangle,
+}
+
+impl ShapeKind {
+    pub const ALL: [ShapeKind; 4] = [
+        ShapeKind::Line,
+        ShapeKind::Rect,
+        ShapeKind::Ellipse,
+        ShapeKind::Triangle,
+    ];
+
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Line => "sumi-line-symbolic",
+            Self::Rect => "sumi-rect-symbolic",
+            Self::Ellipse => "sumi-ellipse-symbolic",
+            Self::Triangle => "sumi-triangle-symbolic",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Line => "直線",
+            Self::Rect => "四角形",
+            Self::Ellipse => "円",
+            Self::Triangle => "三角形",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct Point {
     pub x: f64,
@@ -127,6 +165,9 @@ pub struct Stroke {
     pub color: String,
     pub width: f64,
     pub points: Vec<Point>,
+    /// Set when the stroke is a geometric shape instead of handwriting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<ShapeKind>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]

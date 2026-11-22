@@ -25,6 +25,26 @@ const ACTIONS: &[(&str, &str)] = &[
         include_str!("../assets/icons/actions/sumi-hand-symbolic.svg"),
     ),
     (
+        "sumi-shape-symbolic.svg",
+        include_str!("../assets/icons/actions/sumi-shape-symbolic.svg"),
+    ),
+    (
+        "sumi-line-symbolic.svg",
+        include_str!("../assets/icons/actions/sumi-line-symbolic.svg"),
+    ),
+    (
+        "sumi-rect-symbolic.svg",
+        include_str!("../assets/icons/actions/sumi-rect-symbolic.svg"),
+    ),
+    (
+        "sumi-ellipse-symbolic.svg",
+        include_str!("../assets/icons/actions/sumi-ellipse-symbolic.svg"),
+    ),
+    (
+        "sumi-triangle-symbolic.svg",
+        include_str!("../assets/icons/actions/sumi-triangle-symbolic.svg"),
+    ),
+    (
         "sumi-infinite-symbolic.svg",
         include_str!("../assets/icons/actions/sumi-infinite-symbolic.svg"),
     ),

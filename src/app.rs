@@ -14,7 +14,7 @@ use libadwaita::prelude::*;
 
 use crate::canvas::{Canvas, Tool, ViewInfo};
 use crate::model::{
-    now_secs, Note, NoteKind, NoteMeta, Page, ToolSettings, ERASER_SIZE_RANGE,
+    now_secs, Note, NoteKind, NoteMeta, Page, ShapeKind, ToolSettings, ERASER_SIZE_RANGE,
     HIGHLIGHTER_SIZE_RANGE, PEN_SIZE_RANGE,
 };
 use crate::pdf::{self, PdfDoc};
@@ -44,8 +44,11 @@ struct Toolbar {
     pen: gtk::ToggleButton,
     highlighter: gtk::ToggleButton,
     eraser: gtk::ToggleButton,
+    shape: gtk::ToggleButton,
     select: gtk::ToggleButton,
     hand: gtk::ToggleButton,
+    shape_picker: gtk::Box,
+    shape_buttons: Vec<(gtk::ToggleButton, ShapeKind)>,
     palette: gtk::Box,
     pen_palette: gtk::Box,
     highlight_palette: gtk::Box,
@@ -60,6 +63,7 @@ impl Toolbar {
             Tool::Pen => &self.pen,
             Tool::Highlighter => &self.highlighter,
             Tool::Eraser => &self.eraser,
+            Tool::Shape => &self.shape,
             Tool::Select => &self.select,
             Tool::Hand => &self.hand,
         }
@@ -214,6 +218,7 @@ struct AppState {
     pen_size: f64,
     highlighter_size: f64,
     eraser_size: f64,
+    shape_kind: ShapeKind,
     pending: HashMap<String, Note>,
     saved_pages: HashMap<String, Vec<Page>>,
     rebuilding: bool,
@@ -236,6 +241,7 @@ impl AppState {
             pen_size: settings.pen_size,
             highlighter_size: settings.highlighter_size,
             eraser_size: settings.eraser_size,
+            shape_kind: ShapeKind::Line,
             pending: HashMap::new(),
             saved_pages: HashMap::new(),
             rebuilding: false,
@@ -519,10 +525,12 @@ fn build_toolbar() -> Toolbar {
     let eraser = tool_button("sumi-eraser-symbolic", "消しゴム (3)");
     let select = tool_button("sumi-select-symbolic", "選択 (5)");
     let hand = tool_button("sumi-hand-symbolic", "移動 (4)");
+    let shape = tool_button("sumi-shape-symbolic", "図形 (6)");
     highlighter.set_group(Some(&pen));
     eraser.set_group(Some(&pen));
     select.set_group(Some(&pen));
     hand.set_group(Some(&pen));
+    shape.set_group(Some(&pen));
     pen.set_active(true);
 
     root.append(&pen);
@@ -530,7 +538,32 @@ fn build_toolbar() -> Toolbar {
     root.append(&eraser);
     root.append(&select);
     root.append(&hand);
+    root.append(&shape);
     root.append(&separator());
+
+    // Shape picker, only visible while the shape tool is active.
+    let shape_picker = gtk::Box::new(Orientation::Horizontal, 4);
+    let mut shape_buttons = Vec::new();
+    let mut first_shape: Option<gtk::ToggleButton> = None;
+    for kind in ShapeKind::ALL {
+        let button = gtk::ToggleButton::new();
+        let image = gtk::Image::from_icon_name(kind.icon());
+        image.set_pixel_size(17);
+        button.set_child(Some(&image));
+        button.set_tooltip_text(Some(kind.label()));
+        button.add_css_class("tool");
+        button.set_focus_on_click(false);
+        if let Some(first) = &first_shape {
+            button.set_group(Some(first));
+        } else {
+            button.set_active(true);
+            first_shape = Some(button.clone());
+        }
+        shape_picker.append(&button);
+        shape_buttons.push((button, kind));
+    }
+    shape_picker.set_visible(false);
+    root.append(&shape_picker);
 
     let pen_palette = gtk::Box::new(Orientation::Horizontal, 6);
     let highlight_palette = gtk::Box::new(Orientation::Horizontal, 6);
@@ -571,8 +604,11 @@ fn build_toolbar() -> Toolbar {
         pen,
         highlighter,
         eraser,
+        shape,
         select,
         hand,
+        shape_picker,
+        shape_buttons,
         palette,
         pen_palette,
         highlight_palette,
@@ -708,6 +744,7 @@ impl App {
             (Tool::Eraser, self.toolbar.eraser.clone()),
             (Tool::Select, self.toolbar.select.clone()),
             (Tool::Hand, self.toolbar.hand.clone()),
+            (Tool::Shape, self.toolbar.shape.clone()),
         ] {
             let weak = Rc::downgrade(self);
             button.connect_toggled(move |button| {
@@ -715,6 +752,22 @@ impl App {
                     if let Some(app) = weak.upgrade() {
                         app.apply_tool(tool);
                     }
+                }
+            });
+        }
+
+        // Shape picker: choosing a shape keeps the shape tool active.
+        for (button, kind) in &self.toolbar.shape_buttons {
+            let weak = Rc::downgrade(self);
+            let kind = *kind;
+            button.connect_toggled(move |button| {
+                if !button.is_active() {
+                    return;
+                }
+                if let Some(app) = weak.upgrade() {
+                    app.state.borrow_mut().shape_kind = kind;
+                    app.canvas.set_shape_kind(kind);
+                    app.canvas.area.grab_focus();
                 }
             });
         }
@@ -743,7 +796,7 @@ impl App {
                     {
                         let mut st = app.state.borrow_mut();
                         match tool {
-                            Tool::Pen => st.pen_size = value,
+                            Tool::Pen | Tool::Shape => st.pen_size = value,
                             Tool::Highlighter => st.highlighter_size = value,
                             Tool::Eraser => st.eraser_size = value,
                             Tool::Select | Tool::Hand => {}
@@ -751,7 +804,7 @@ impl App {
                     }
                     app.persist_tool_settings();
                     match tool {
-                        Tool::Pen => app.canvas.set_pen_size(value),
+                        Tool::Pen | Tool::Shape => app.canvas.set_pen_size(value),
                         Tool::Highlighter => app.canvas.set_highlighter_size(value),
                         Tool::Eraser => app.canvas.set_eraser_size(value),
                         Tool::Select | Tool::Hand => {}
@@ -1213,6 +1266,7 @@ impl App {
                         gdk::Key::_3 => Some(Tool::Eraser),
                         gdk::Key::_4 => Some(Tool::Hand),
                         gdk::Key::_5 => Some(Tool::Select),
+                        gdk::Key::_6 => Some(Tool::Shape),
                         _ => None,
                     };
                     if let Some(tool) = tool {
@@ -1875,20 +1929,35 @@ impl App {
             )
         };
         // With the select tool the palettes recolor the selection instead.
-        let show_palette = matches!(tool, Tool::Pen | Tool::Highlighter | Tool::Select);
+        let show_palette = matches!(
+            tool,
+            Tool::Pen | Tool::Highlighter | Tool::Select | Tool::Shape
+        );
         self.toolbar.palette.set_visible(show_palette);
+        self.toolbar.shape_picker.set_visible(tool == Tool::Shape);
+        {
+            let shape_kind = self.state.borrow().shape_kind;
+            for (button, kind) in &self.toolbar.shape_buttons {
+                if button.is_active() != (*kind == shape_kind) {
+                    button.set_active(*kind == shape_kind);
+                }
+            }
+        }
         self.toolbar
             .pen_palette
-            .set_visible(matches!(tool, Tool::Pen | Tool::Select));
+            .set_visible(matches!(tool, Tool::Pen | Tool::Select | Tool::Shape));
         self.toolbar
             .highlight_palette
             .set_visible(matches!(tool, Tool::Highlighter | Tool::Select));
-        let show_size = matches!(tool, Tool::Pen | Tool::Highlighter | Tool::Eraser);
+        let show_size = matches!(
+            tool,
+            Tool::Pen | Tool::Highlighter | Tool::Eraser | Tool::Shape
+        );
         self.toolbar.size.set_visible(show_size);
         self.toolbar.size_value.set_visible(show_size);
 
         let (lower, upper, value) = match tool {
-            Tool::Pen => (PEN_SIZE_RANGE.0, PEN_SIZE_RANGE.1, pen_size),
+            Tool::Pen | Tool::Shape => (PEN_SIZE_RANGE.0, PEN_SIZE_RANGE.1, pen_size),
             Tool::Highlighter => (
                 HIGHLIGHTER_SIZE_RANGE.0,
                 HIGHLIGHTER_SIZE_RANGE.1,
@@ -1911,7 +1980,7 @@ impl App {
         for (button, color, highlighter) in &self.toolbar.swatches {
             let visible = match tool {
                 Tool::Highlighter => *highlighter,
-                Tool::Pen => !*highlighter,
+                Tool::Pen | Tool::Shape => !*highlighter,
                 Tool::Select => true,
                 Tool::Eraser | Tool::Hand => false,
             };
@@ -2166,6 +2235,7 @@ mod tests {
                 color: "#000000".into(),
                 width: 3.0,
                 points: vec![Point { x, y: 1.0, p: 0.5 }],
+                shape: None,
             }],
         }
     }

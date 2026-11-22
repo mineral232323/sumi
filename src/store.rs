@@ -60,11 +60,9 @@ impl Store {
     /// fall back to the built-in defaults.
     pub fn load_tool_settings(&self) -> ToolSettings {
         self.conn
-            .query_row(
-                "SELECT value FROM settings WHERE key = 'tool'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
+            .query_row("SELECT value FROM settings WHERE key = 'tool'", [], |row| {
+                row.get::<_, String>(0)
+            })
             .optional()
             .ok()
             .flatten()
@@ -317,7 +315,7 @@ impl Store {
 mod tests {
     use super::*;
     use crate::model::{
-        Point, Stroke, StrokeTool, HIGHLIGHTER_SIZE_RANGE, PEN_SIZE_RANGE,
+        Point, ShapeKind, Stroke, StrokeTool, HIGHLIGHTER_SIZE_RANGE, PEN_SIZE_RANGE,
     };
 
     fn temp_store() -> (Store, PathBuf) {
@@ -345,6 +343,7 @@ mod tests {
                     p: 0.5,
                 },
             ],
+            shape: None,
         });
         note.add_page();
         note
@@ -370,6 +369,7 @@ mod tests {
                 y: 2.0,
                 p: 0.5,
             }],
+            shape: None,
         });
         store.save(&changed, &[1]).unwrap();
         let loaded = store.load(&note.id).unwrap();
@@ -408,6 +408,50 @@ mod tests {
         assert_eq!(loaded.pen_size, PEN_SIZE_RANGE.1);
         assert_eq!(loaded.highlighter_size, HIGHLIGHTER_SIZE_RANGE.0);
         assert_eq!(loaded.eraser_size, 26.0);
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn keeps_shape_strokes_and_reads_old_pages() {
+        let (store, dir) = temp_store();
+        let mut note = Note::new(NoteKind::Paged, "shapes");
+        note.pages[0].strokes.push(Stroke {
+            id: 1,
+            tool: StrokeTool::Pen,
+            color: "#000000".into(),
+            width: 2.0,
+            points: vec![
+                Point {
+                    x: 1.0,
+                    y: 1.0,
+                    p: 0.5,
+                },
+                Point {
+                    x: 9.0,
+                    y: 5.0,
+                    p: 0.5,
+                },
+            ],
+            shape: Some(ShapeKind::Rect),
+        });
+        store.save_all(&note).unwrap();
+        let loaded = store.load(&note.id).unwrap();
+        assert_eq!(loaded.pages[0].strokes[0].shape, Some(ShapeKind::Rect));
+
+        // Pages written before shapes existed have no `shape` field.
+        store
+            .conn
+            .execute(
+                "UPDATE note_pages SET data = ?1 WHERE note_id = ?2 AND page_index = 0",
+                params![
+                    "{\"strokes\":[{\"id\":1,\"tool\":\"pen\",\"color\":\"#000000\",\"width\":3.0,\"points\":[{\"x\":1.0,\"y\":2.0}]}]}",
+                    note.id
+                ],
+            )
+            .unwrap();
+        let loaded = store.load(&note.id).unwrap();
+        assert_eq!(loaded.pages[0].strokes[0].shape, None);
         drop(store);
         let _ = fs::remove_dir_all(dir);
     }
