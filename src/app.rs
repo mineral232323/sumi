@@ -2028,14 +2028,16 @@ impl App {
 }
 
 fn build_note_row(meta: &NoteMeta) -> (gtk::ListBoxRow, gtk::Label, gtk::Label) {
-    let icon_box = gtk::Box::new(Orientation::Vertical, 0);
+    // CenterBox keeps the glyph in the middle of the tile on both axes; a plain
+    // Box leaves the non-expanding image at the top of the 36x36 tile.
+    let icon_box = gtk::CenterBox::new();
     icon_box.set_size_request(36, 36);
     icon_box.set_halign(gtk::Align::Center);
     icon_box.set_valign(gtk::Align::Center);
     icon_box.add_css_class("note-icon");
     let icon = gtk::Image::from_icon_name(meta.kind.icon());
     icon.set_pixel_size(18);
-    icon_box.append(&icon);
+    icon_box.set_center_widget(Some(&icon));
 
     let title = gtk::Label::new(Some(if meta.title.trim().is_empty() {
         "無題のノート"
