@@ -629,6 +629,14 @@ fn tool_button(icon: &str, tooltip: &str) -> gtk::ToggleButton {
     button
 }
 
+fn palette_applies_to(tool: Tool, highlighter: bool) -> bool {
+    if highlighter {
+        tool == Tool::Highlighter
+    } else {
+        matches!(tool, Tool::Pen | Tool::Shape)
+    }
+}
+
 fn make_swatch(id: &str, color: &str) -> gtk::Button {
     let button = gtk::Button::new();
     button.add_css_class("swatch");
@@ -1914,9 +1922,9 @@ impl App {
                 st.pen_color = color.to_string();
             }
         }
-        let applies =
-            (highlighter && active == Tool::Highlighter) || (!highlighter && active == Tool::Pen);
-        if applies {
+        // The shape tool draws with the pen colour, so it follows the palette
+        // too; the eraser and hand have no colour of their own.
+        if palette_applies_to(active, highlighter) {
             self.canvas.set_color(color);
         }
         if active == Tool::Select && self.canvas.recolor_selection(color, highlighter) {
@@ -2274,5 +2282,21 @@ mod tests {
             vec![0, 1]
         );
         assert!(dirty_page_indices(Some(&[a.clone(), b.clone()]), &[a]).is_empty());
+    }
+
+    #[test]
+    fn palette_colour_reaches_the_tools_that_draw() {
+        // Pen and shape share the pen colour; the highlighter keeps its own.
+        assert!(palette_applies_to(Tool::Pen, false));
+        assert!(palette_applies_to(Tool::Shape, false));
+        assert!(!palette_applies_to(Tool::Pen, true));
+        assert!(!palette_applies_to(Tool::Shape, true));
+        assert!(palette_applies_to(Tool::Highlighter, true));
+        assert!(!palette_applies_to(Tool::Highlighter, false));
+        // Nothing draws with a palette colour here.
+        assert!(!palette_applies_to(Tool::Eraser, false));
+        assert!(!palette_applies_to(Tool::Hand, false));
+        assert!(!palette_applies_to(Tool::Select, false));
+        assert!(!palette_applies_to(Tool::Select, true));
     }
 }
