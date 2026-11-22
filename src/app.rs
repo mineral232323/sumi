@@ -1812,6 +1812,15 @@ impl App {
             .set_text(&format!("{} / {}", info.page.min(pages - 1) + 1, pages));
         self.add_page_btn
             .set_visible(info.kind == Some(NoteKind::Paged));
+
+        // Selecting strokes changes which palette swatches are marked.
+        if self.state.borrow().active_tool == Tool::Select {
+            let (pen_color, highlight_color) = {
+                let st = self.state.borrow();
+                (st.pen_color.clone(), st.highlight_color.clone())
+            };
+            self.update_palette_ring(Tool::Select, &pen_color, &highlight_color);
+        }
     }
 
     fn update_header(&self, note: &Note) {
@@ -1977,6 +1986,13 @@ impl App {
         self.toolbar.size_value.set_text(&format!("{value:.1}"));
         self.state.borrow_mut().adjusting = false;
 
+        self.update_palette_ring(tool, &pen_color, &highlight_color);
+    }
+
+    /// Marks the palette swatch that matches the current colour. With the
+    /// select tool the palettes recolor the selection instead of a current
+    /// colour, so there the ring follows the colours the selection uses.
+    fn update_palette_ring(&self, tool: Tool, pen_color: &str, highlight_color: &str) {
         for (button, color, highlighter) in &self.toolbar.swatches {
             let visible = match tool {
                 Tool::Highlighter => *highlighter,
@@ -1984,12 +2000,12 @@ impl App {
                 Tool::Select => true,
                 Tool::Eraser | Tool::Hand => false,
             };
-            let selected = if *highlighter {
-                &highlight_color
-            } else {
-                &pen_color
-            };
-            let is_selected = visible && color == selected;
+            let is_selected = visible
+                && match tool {
+                    Tool::Select => self.canvas.selection_has_color(color, *highlighter),
+                    _ if *highlighter => color == highlight_color,
+                    _ => color == pen_color,
+                };
             if is_selected {
                 button.add_css_class("selected");
             } else {

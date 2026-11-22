@@ -452,6 +452,25 @@ impl State {
         true
     }
 
+    /// Whether a stroke of this colour and tool group is selected, so the
+    /// palette can mark the colours the selection already uses.
+    fn selection_has_color(&self, color: &str, highlighter: bool) -> bool {
+        let Some(page) = self.selection_page else {
+            return false;
+        };
+        let Some(note) = &self.note else {
+            return false;
+        };
+        let Some(page_data) = note.pages.get(page) else {
+            return false;
+        };
+        page_data.strokes.iter().any(|stroke| {
+            self.selection.contains(&stroke.id)
+                && stroke.color == color
+                && (stroke.tool == StrokeTool::Highlighter) == highlighter
+        })
+    }
+
     fn prune_selection(&mut self) {
         let Some(page) = self.selection_page else {
             self.selection.clear();
@@ -629,8 +648,10 @@ impl Canvas {
                     area.queue_draw();
                     if changed {
                         notify_changed(&state);
-                        emit_view(&state);
                     }
+                    // Selection changes are not content edits, but the palette
+                    // marks the colours the selection uses.
+                    emit_view(&state);
                 }
             }
         });
@@ -823,8 +844,8 @@ impl Canvas {
                     area.queue_draw();
                     if changed {
                         notify_changed(&state);
-                        emit_view(&state);
                     }
+                    emit_view(&state);
                 }
             }
         });
@@ -857,6 +878,7 @@ impl Canvas {
                 if let Some(area) = area_w.upgrade() {
                     area.queue_draw();
                 }
+                emit_view(&state);
             }
         });
         area.add_controller(click);
@@ -1229,6 +1251,7 @@ impl Canvas {
     pub fn clear_selection(&self) {
         self.state.borrow_mut().clear_selection();
         self.area.queue_draw();
+        emit_view(&self.state);
     }
 
     pub fn select_all(&self) {
@@ -1417,6 +1440,11 @@ impl Canvas {
             notify_changed(&self.state);
         }
         changed
+    }
+
+    /// Whether the selection holds a stroke in this colour and tool group.
+    pub fn selection_has_color(&self, color: &str, highlighter: bool) -> bool {
+        self.state.borrow().selection_has_color(color, highlighter)
     }
 
     pub fn set_pen_size(&self, size: f64) {
@@ -3371,6 +3399,19 @@ mod tests {
             "#000000"
         );
         assert!(state.recolor_selection("#2f6fed", false));
+    }
+
+    #[test]
+    fn selection_reports_only_the_colours_it_uses() {
+        let mut state = state_with_stroke();
+        state.selection = vec![1];
+        state.selection_page = Some(0);
+        assert!(state.selection_has_color("#000000", false));
+        assert!(!state.selection_has_color("#000000", true));
+        assert!(!state.selection_has_color("#2f6fed", false));
+
+        state.clear_selection();
+        assert!(!state.selection_has_color("#000000", false));
     }
 
     #[test]
