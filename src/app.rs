@@ -1856,6 +1856,9 @@ impl App {
         if applies {
             self.canvas.set_color(color);
         }
+        if active == Tool::Select && self.canvas.recolor_selection(color, highlighter) {
+            self.canvas.area.grab_focus();
+        }
         self.update_tool_ui();
     }
 
@@ -1871,12 +1874,15 @@ impl App {
                 st.eraser_size,
             )
         };
-        let show_palette = matches!(tool, Tool::Pen | Tool::Highlighter);
+        // With the select tool the palettes recolor the selection instead.
+        let show_palette = matches!(tool, Tool::Pen | Tool::Highlighter | Tool::Select);
         self.toolbar.palette.set_visible(show_palette);
-        self.toolbar.pen_palette.set_visible(tool == Tool::Pen);
+        self.toolbar
+            .pen_palette
+            .set_visible(matches!(tool, Tool::Pen | Tool::Select));
         self.toolbar
             .highlight_palette
-            .set_visible(tool == Tool::Highlighter);
+            .set_visible(matches!(tool, Tool::Highlighter | Tool::Select));
         let show_size = matches!(tool, Tool::Pen | Tool::Highlighter | Tool::Eraser);
         self.toolbar.size.set_visible(show_size);
         self.toolbar.size_value.set_visible(show_size);
@@ -1902,15 +1908,17 @@ impl App {
         self.toolbar.size_value.set_text(&format!("{value:.1}"));
         self.state.borrow_mut().adjusting = false;
 
-        let selected = match tool {
-            Tool::Highlighter => &highlight_color,
-            _ => &pen_color,
-        };
         for (button, color, highlighter) in &self.toolbar.swatches {
-            let visible = if *highlighter {
-                tool == Tool::Highlighter
+            let visible = match tool {
+                Tool::Highlighter => *highlighter,
+                Tool::Pen => !*highlighter,
+                Tool::Select => true,
+                Tool::Eraser | Tool::Hand => false,
+            };
+            let selected = if *highlighter {
+                &highlight_color
             } else {
-                tool == Tool::Pen
+                &pen_color
             };
             let is_selected = visible && color == selected;
             if is_selected {

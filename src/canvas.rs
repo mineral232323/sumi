@@ -178,6 +178,11 @@ enum Action {
         dx: f64,
         dy: f64,
     },
+    RecolorStrokes {
+        page: usize,
+        color: String,
+        previous: Vec<(u64, String)>,
+    },
 }
 
 struct CachedPdf {
@@ -395,6 +400,47 @@ impl State {
     fn clear_selection(&mut self) {
         self.selection.clear();
         self.selection_page = None;
+    }
+
+    /// Recolor the selected strokes of one tool group.
+    /// `highlighter` picks the marker strokes, otherwise the pen strokes.
+    fn recolor_selection(&mut self, color: &str, highlighter: bool) -> bool {
+        let Some(page) = self.selection_page else {
+            return false;
+        };
+        let ids = self.selection.clone();
+        let Some(note) = &mut self.note else {
+            return false;
+        };
+        let Some(page_data) = note.pages.get_mut(page) else {
+            return false;
+        };
+        let mut previous = Vec::new();
+        for stroke in &mut page_data.strokes {
+            if !ids.contains(&stroke.id) {
+                continue;
+            }
+            if (stroke.tool == StrokeTool::Highlighter) != highlighter {
+                continue;
+            }
+            if stroke.color == color {
+                continue;
+            }
+            previous.push((stroke.id, stroke.color.clone()));
+            stroke.color = color.to_string();
+        }
+        if previous.is_empty() {
+            return false;
+        }
+        note.touch();
+        self.undo.push(Action::RecolorStrokes {
+            page,
+            color: color.to_string(),
+            previous,
+        });
+        self.redo.clear();
+        self.invalidate_ink();
+        true
     }
 
     fn prune_selection(&mut self) {
@@ -1350,6 +1396,17 @@ impl Canvas {
         self.state.borrow_mut().color = color.to_string();
     }
 
+    /// Give the selected strokes a new color. Returns false when nothing changed.
+    pub fn recolor_selection(&self, color: &str, highlighter: bool) -> bool {
+        let changed = self.state.borrow_mut().recolor_selection(color, highlighter);
+        if changed {
+            self.area.queue_draw();
+            emit_view(&self.state);
+            notify_changed(&self.state);
+        }
+        changed
+    }
+
     pub fn set_pen_size(&self, size: f64) {
         self.state.borrow_mut().pen_size = size;
     }
@@ -1573,6 +1630,28 @@ impl State {
                         point.x += dx;
                         point.y += dy;
                     }
+                }
+                found
+            }
+            Action::RecolorStrokes {
+                page,
+                color,
+                previous,
+            } => {
+                let Some(p) = note.pages.get_mut(*page) else {
+                    return false;
+                };
+                let mut found = false;
+                for stroke in &mut p.strokes {
+                    let Some((_, old)) = previous.iter().find(|(id, _)| *id == stroke.id) else {
+                        continue;
+                    };
+                    found = true;
+                    stroke.color = if forward {
+                        color.clone()
+                    } else {
+                        old.clone()
+                    };
                 }
                 found
             }
@@ -2991,6 +3070,39 @@ mod tests {
         let strokes = &state.note.as_ref().unwrap().pages[0].strokes;
         assert!((strokes[0].points[0].x - 20.0).abs() < 1e-9);
         assert!((strokes[1].points[0].x - 60.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn recolor_selection_changes_and_undoes() {
+        let mut state = state_with_stroke();
+        state.selection = vec![1];
+        state.selection_page = Some(0);
+        assert!(state.recolor_selection("#ff0000", false));
+        let stroke = &state.note.as_ref().unwrap().pages[0].strokes[0];
+        assert_eq!(stroke.color, "#ff0000");
+        // Same color again is a no-op, so undo never records empty steps.
+        assert!(!state.recolor_selection("#ff0000", false));
+
+        let action = state.undo.pop().unwrap();
+        assert!(state.apply_action(&action, false));
+        let stroke = &state.note.as_ref().unwrap().pages[0].strokes[0];
+        assert_eq!(stroke.color, "#000000");
+        assert!(state.apply_action(&action, true));
+        let stroke = &state.note.as_ref().unwrap().pages[0].strokes[0];
+        assert_eq!(stroke.color, "#ff0000");
+    }
+
+    #[test]
+    fn recolor_only_touches_the_selected_tool_group() {
+        let mut state = state_with_stroke();
+        state.selection = vec![1];
+        state.selection_page = Some(0);
+        assert!(!state.recolor_selection("#ffe066", true));
+        assert_eq!(
+            state.note.as_ref().unwrap().pages[0].strokes[0].color,
+            "#000000"
+        );
+        assert!(state.recolor_selection("#2f6fed", false));
     }
 
     #[test]
