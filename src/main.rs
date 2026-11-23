@@ -1,5 +1,6 @@
 mod app;
 mod canvas;
+mod export;
 mod icons;
 mod model;
 mod pdf;

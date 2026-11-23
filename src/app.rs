@@ -1428,6 +1428,25 @@ impl App {
         }
         body.append(&save);
 
+        let export = menu_button(
+            "document-save-as-symbolic",
+            "PDFに書き出す",
+            "PDF形式で保存",
+        );
+        {
+            let weak = Rc::downgrade(self);
+            let pop = popover.downgrade();
+            export.connect_clicked(move |_| {
+                if let Some(pop) = pop.upgrade() {
+                    pop.popdown();
+                }
+                if let Some(app) = weak.upgrade() {
+                    app.export_pdf();
+                }
+            });
+        }
+        body.append(&export);
+
         let rename = menu_button("document-edit-symbolic", "名前を変更", "");
         {
             let weak = Rc::downgrade(self);
@@ -1718,6 +1737,66 @@ impl App {
                 app.state.borrow_mut().metas.insert(0, note.meta());
                 app.state.borrow_mut().active_id = Some(note.id.clone());
                 app.open_note(note);
+            },
+        );
+    }
+
+    fn export_pdf(self: &Rc<Self>) {
+        let Some(note) = self.canvas.note() else {
+            return;
+        };
+        let dialog = gtk::FileDialog::builder()
+            .title("PDFに書き出す")
+            .modal(true)
+            .accept_label("書き出す")
+            .initial_name(format!("{}.pdf", safe_file_stem(&note.title)))
+            .build();
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("PDF"));
+        filter.add_mime_type("application/pdf");
+        filter.add_pattern("*.pdf");
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        dialog.set_filters(Some(&filters));
+        dialog.set_default_filter(Some(&filter));
+
+        let weak = Rc::downgrade(self);
+        dialog.save(
+            Some(&self.window),
+            None::<&gio::Cancellable>,
+            move |result| {
+                let Some(app) = weak.upgrade() else { return };
+                let Ok(file) = result else { return };
+                let Some(mut path) = file.path() else {
+                    app.toast("保存先を決められません");
+                    return;
+                };
+                let has_pdf_extension = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.eq_ignore_ascii_case("pdf"))
+                    .unwrap_or(false);
+                if !has_pdf_extension {
+                    path.set_extension("pdf");
+                }
+
+                // Imported PDF pages become the background of their export.
+                let pdf = if note.kind == NoteKind::Pdf {
+                    note.pdf_file.as_ref().and_then(|name| {
+                        let source = app.store.borrow().pdf_path(name);
+                        PdfDoc::open(&source).ok()
+                    })
+                } else {
+                    None
+                };
+
+                app.window.set_cursor_from_name(Some("wait"));
+                let result = crate::export::export(&note, pdf.as_ref(), &path);
+                app.window.set_cursor_from_name(None);
+                match result {
+                    Ok(count) => app.toast(&format!("{count}ページをPDFに書き出しました")),
+                    Err(error) => app.toast(&error),
+                }
             },
         );
     }
@@ -2196,6 +2275,22 @@ fn relative_time(timestamp: i64) -> String {
             .map(|s| s.to_string())
             .unwrap_or_default()
     }
+}
+
+/// Turn a note title into something safe to use as a file name.
+fn safe_file_stem(title: &str) -> String {
+    let cleaned: String = title
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' | '\t' => '-',
+            c => c,
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    if trimmed.is_empty() {
+        return "sumi".into();
+    }
+    trimmed.chars().take(80).collect()
 }
 
 fn menu_button(icon: &str, label: &str, subtitle: &str) -> gtk::Button {

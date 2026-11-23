@@ -23,6 +23,23 @@ impl PdfDoc {
         self.document.page(index as i32).map(|page| page.size())
     }
 
+    /// Draw a page into an existing context, scaled to the given point size.
+    /// Used by the PDF export so the original page stays vector.
+    pub fn render_into(&self, index: usize, ctx: &Context, width: f64, height: f64) -> bool {
+        let Some(page) = self.document.page(index as i32) else {
+            return false;
+        };
+        let (pw, ph) = page.size();
+        if pw <= 0.0 || ph <= 0.0 || width <= 0.0 || height <= 0.0 {
+            return false;
+        }
+        let _ = ctx.save();
+        ctx.scale(width / pw, height / ph);
+        page.render(ctx);
+        let _ = ctx.restore();
+        true
+    }
+
     /// Render a page at the given pixel width. Returns a white-backed surface.
     pub fn render(&self, index: usize, width_px: f64) -> Option<ImageSurface> {
         let page = self.document.page(index as i32)?;

@@ -2955,19 +2955,40 @@ impl State {
     }
 }
 
-fn paint_stroke(ctx: &Context, stroke: &Stroke, path: &Path, alpha: f64) {
+fn set_stroke_style(ctx: &Context, stroke: &Stroke, alpha: f64) {
     let (r, g, b) = hex_to_cairo(&stroke.color);
     if stroke.tool == StrokeTool::Highlighter {
         ctx.set_source_rgba(r, g, b, 0.30 * alpha);
     } else {
         ctx.set_source_rgba(r, g, b, alpha);
     }
-    ctx.new_path();
-    ctx.append_path(path);
     ctx.set_line_width(stroke.width.max(0.4));
     ctx.set_line_cap(cairo::LineCap::Round);
     ctx.set_line_join(cairo::LineJoin::Round);
+}
+
+fn paint_stroke(ctx: &Context, stroke: &Stroke, path: &Path, alpha: f64) {
+    set_stroke_style(ctx, stroke, alpha);
+    ctx.new_path();
+    ctx.append_path(path);
     let _ = ctx.stroke();
+}
+
+/// Draw a stroke directly in the context's current user space. Used by the PDF
+/// export, which builds the page transform instead of a cache path.
+pub(crate) fn draw_stroke(ctx: &Context, stroke: &Stroke, alpha: f64) {
+    set_stroke_style(ctx, stroke, alpha);
+    ctx.new_path();
+    build_stroke_path(ctx, stroke);
+    let _ = ctx.stroke();
+}
+
+/// Bounding box of every stroke on a page, in world coordinates.
+pub(crate) fn page_content_bounds(page: &Page) -> Option<Rect> {
+    page.strokes
+        .iter()
+        .filter_map(stroke_bounds)
+        .reduce(union_rect)
 }
 
 fn rounded_rect(ctx: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
@@ -3128,7 +3149,7 @@ fn build_live_stroke_path(ctx: &Context, stroke: &Stroke) {
     append_smooth_polyline(ctx, &xy);
 }
 
-fn build_stroke_path(ctx: &Context, stroke: &Stroke) {
+pub(crate) fn build_stroke_path(ctx: &Context, stroke: &Stroke) {
     if let Some(kind) = stroke.shape {
         append_shape_path(ctx, kind, &stroke.points);
         return;
